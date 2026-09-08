@@ -27,6 +27,9 @@ class Settings(BaseSettings):
     jira_status_blocked: str = "Blocked"
     jira_status_done: str = "Done"
 
+    # Jira polling interval for the scheduled intake job (phase 1.6).
+    jira_poll_interval_minutes: int = 30
+
     # Optional fallback names per stage when the primary name has no matching transition.
     # Set as JSON in .env, e.g.:
     #   JIRA_STATUS_FALLBACKS={"in_progress":"Start Progress","done":"Resolved"}
