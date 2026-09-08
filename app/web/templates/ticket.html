@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>{{ ticket.external_key or ticket.id }} — Agentic SDLC</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <main>
+    <a href="/" class="back-link">← All tickets</a>
+
+    <section class="card">
+      <h1>{{ ticket.title }}</h1>
+      <div class="ticket-meta">
+        {% if ticket.external_key %}
+        <span><strong>Jira key</strong> {{ ticket.external_key }}</span>
+        {% endif %}
+        <span><strong>Status</strong>
+          <span class="badge badge--{{ ticket.status }}">{{ ticket.status }}</span>
+        </span>
+        <span><strong>Claimed</strong>
+          {% if ticket.claimed_at %}{{ ticket.claimed_at.strftime('%Y-%m-%d %H:%M UTC') }}{% else %}no{% endif %}
+        </span>
+        {% if ticket.repos %}
+        <span><strong>Repos</strong> {{ ticket.repos | join(', ') }}</span>
+        {% endif %}
+        <span><strong>ID</strong> <code>{{ ticket.id }}</code></span>
+      </div>
+
+      {% if ticket.description %}
+      <div class="description-box">{{ ticket.description }}</div>
+      {% endif %}
+    </section>
+
+    <section class="card">
+      <h2>
+        Live activity
+        <span id="feed-status" style="font-size:0.75rem;font-weight:400;color:#94a3b8;margin-left:0.5rem">connecting…</span>
+      </h2>
+
+      <div id="activity-feed">
+        <div id="feed-empty">No events yet — waiting for activity on this ticket.</div>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const TICKET_ID = "{{ ticket.id }}";
+    const feed = document.getElementById('activity-feed');
+    const feedStatus = document.getElementById('feed-status');
+    let emptyEl = document.getElementById('feed-empty');
+
+    function fmtTime(isoStr) {
+      try {
+        const d = new Date(isoStr);
+        return d.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit', second: '2-digit'});
+      } catch { return isoStr || ''; }
+    }
+
+    function appendEvent(ev) {
+      if (emptyEl) { emptyEl.remove(); emptyEl = null; }
+      const agent = (ev.agent || 'system').toLowerCase();
+      const row = document.createElement('div');
+      row.className = `ev-row ev--${agent}`;
+      row.innerHTML =
+        `<span class="ev-agent">${ev.agent || '—'}</span>` +
+        `<span class="ev-stage">${ev.stage || '—'}</span>` +
+        `<span class="ev-msg">${ev.message || ''}</span>` +
+        `<span class="ev-ts">${fmtTime(ev.ts)}</span>`;
+      feed.appendChild(row);
+      // Keep newest visible
+      feed.scrollTop = feed.scrollHeight;
+    }
+
+    const es = new EventSource(`/stream/${TICKET_ID}`);
+
+    es.onopen = () => {
+      feedStatus.textContent = 'connected';
+      feedStatus.style.color = '#22c55e';
+    };
+
+    es.onmessage = (e) => {
+      try {
+        const ev = JSON.parse(e.data);
+        appendEvent(ev);
+      } catch {}
+    };
+
+    es.onerror = () => {
+      feedStatus.textContent = 'reconnecting…';
+      feedStatus.style.color = '#f59e0b';
+    };
+  </script>
+</body>
+</html>

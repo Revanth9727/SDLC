@@ -42,7 +42,7 @@
           {% for ticket in tickets %}
           <tr>
             <td class="mono">{{ ticket.external_key or '—' }}</td>
-            <td>{{ ticket.title }}</td>
+            <td><a href="/tickets/{{ ticket.id }}" style="color:#6366f1;text-decoration:none;font-weight:500">{{ ticket.title }}</a></td>
             <td><span class="badge badge--{{ ticket.status }}">{{ ticket.status }}</span></td>
             <td>{% if ticket.claimed_at %}<span class="badge badge--processing">claimed</span>{% else %}—{% endif %}</td>
             <td class="mono" style="font-size:0.8rem">

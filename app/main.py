@@ -69,6 +69,15 @@ def index(request: Request) -> HTMLResponse:
     )
 
 
+@app.get("/tickets/{ticket_id}", response_class=HTMLResponse)
+def ticket_detail(request: Request, ticket_id: str) -> HTMLResponse:
+    with SessionLocal() as db:
+        ticket = db.get(Ticket, ticket_id)
+    if ticket is None:
+        return HTMLResponse(content="<h1>Ticket not found</h1>", status_code=404)
+    return templates.TemplateResponse("ticket.html", {"request": request, "ticket": ticket})
+
+
 @app.post("/tickets")
 def create_ticket(
     title: str = Form(...),
