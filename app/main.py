@@ -4,7 +4,10 @@ Run with:
     uvicorn app.main:app --reload --port 8000
 """
 
+import asyncio
+import json
 import logging
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Form, Request
@@ -12,7 +15,9 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
+from sse_starlette.sse import EventSourceResponse
 
+from app.core.poller import poll_cycle, start_loop
 from app.db.connection import SessionLocal
 from app.db.models import Ticket
 from app.tools.github_tool import GitHubTool
@@ -23,7 +28,27 @@ logger = logging.getLogger(__name__)
 
 _BASE = Path(__file__).parent
 
-app = FastAPI(title="Agentic SDLC")
+# SSE broadcast — one asyncio.Queue per connected client.
+_subscribers: list[asyncio.Queue] = []
+
+
+async def _broadcast(event: dict) -> None:
+    for q in list(_subscribers):
+        await q.put(event)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    task = await start_loop(_broadcast)
+    yield
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
+app = FastAPI(title="Agentic SDLC", lifespan=lifespan)
 
 app.mount(
     "/static",
@@ -90,6 +115,36 @@ def ticket_resolve_repos(key: str) -> JSONResponse:
 
 class _ConfirmReposRequest(BaseModel):
     repos: list[str]
+
+
+@app.get("/poll/events")
+async def poll_events(request: Request) -> EventSourceResponse:
+    """SSE stream — pushes a JSON event for every ticket the poller claims."""
+    q: asyncio.Queue = asyncio.Queue()
+    _subscribers.append(q)
+
+    async def stream():
+        try:
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    event = await asyncio.wait_for(q.get(), timeout=20)
+                    yield {"data": json.dumps(event)}
+                except asyncio.TimeoutError:
+                    yield {"comment": "keepalive"}
+        finally:
+            if q in _subscribers:
+                _subscribers.remove(q)
+
+    return EventSourceResponse(stream())
+
+
+@app.post("/poll/run-once", response_class=JSONResponse)
+async def poll_run_once() -> JSONResponse:
+    """Manually trigger one poll cycle without waiting for the interval."""
+    claimed = await poll_cycle(_broadcast)
+    return JSONResponse(content={"claimed": claimed})
 
 
 @app.post("/ticket/{key}/confirm-repos", response_class=JSONResponse)

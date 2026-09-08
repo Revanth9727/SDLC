@@ -33,6 +33,9 @@ class Ticket(Base):
     repos: Mapped[Optional[list[str]]] = mapped_column(
         ARRAY(Text), nullable=True, default=None
     )  # confirmed GitHub repos e.g. ["owner/repo"] — set by the confirm-repos gate
+    claimed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True, default=None
+    )  # set atomically by the poller when it claims this ticket; None = unclaimed
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,

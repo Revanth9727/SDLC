@@ -114,6 +114,27 @@ class JiraTool:
         logger.info("jira.get_issue -> %r", result)
         return result
 
+    def list_by_status(self, status_name: str) -> list[JiraIssue]:
+        """Return issues for the configured project with exactly ``status_name``."""
+        jql = f'project = {self._project} AND status = "{status_name}" ORDER BY created ASC'
+        logger.info("jira.list_by_status jql=%r", jql)
+        with self._client() as client:
+            resp = client.get(
+                "/rest/api/3/search",
+                params={"jql": jql, "fields": "summary,description,status", "maxResults": 50},
+            )
+            resp.raise_for_status()
+        issues: list[JiraIssue] = []
+        for item in resp.json().get("issues", []):
+            fields = item.get("fields", {})
+            summary, description = self._extract(fields)
+            status = (fields.get("status") or {}).get("name", "")
+            issues.append(
+                JiraIssue(key=item["key"], summary=summary, description=description, status=status)
+            )
+        logger.info("jira.list_by_status status=%r -> %d issues", status_name, len(issues))
+        return issues
+
     def get_transitions(self, key: str) -> list[JiraTransition]:
         """Return the transitions allowed from the issue's CURRENT status.
 

@@ -33,6 +33,7 @@
             <th>ID</th>
             <th>Title</th>
             <th>Status</th>
+            <th>Claimed</th>
           </tr>
         </thead>
         <tbody>
@@ -41,6 +42,7 @@
             <td class="mono">{{ ticket.id }}</td>
             <td>{{ ticket.title }}</td>
             <td><span class="badge badge--{{ ticket.status }}">{{ ticket.status }}</span></td>
+            <td>{% if ticket.claimed_at %}<span class="badge badge--processing">claimed</span>{% else %}—{% endif %}</td>
           </tr>
           {% endfor %}
         </tbody>
@@ -49,6 +51,51 @@
       <p class="empty">No tickets yet — submit one above.</p>
       {% endif %}
     </section>
+
+    <section class="card">
+      <h2>Jira poller</h2>
+      <form id="poll-form">
+        <button type="submit" id="poll-btn">Run poll now</button>
+        <span id="poll-status" style="margin-left:0.75rem;font-size:0.85rem;color:#666;"></span>
+      </form>
+      <div id="poll-events" style="margin-top:1rem;"></div>
+    </section>
   </main>
+
+  <script>
+    // "Run poll now" button
+    document.getElementById('poll-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const btn = document.getElementById('poll-btn');
+      const status = document.getElementById('poll-status');
+      btn.disabled = true;
+      status.textContent = 'running…';
+      try {
+        const res = await fetch('/poll/run-once', { method: 'POST' });
+        const data = await res.json();
+        const n = data.claimed.length;
+        status.textContent = n ? `claimed ${n} ticket(s)` : 'no new To Do tickets found';
+        if (n) setTimeout(() => location.reload(), 1500);
+      } catch (err) {
+        status.textContent = 'error — see server logs';
+      } finally {
+        btn.disabled = false;
+      }
+    });
+
+    // Live SSE feed — shows events as they arrive from background poll cycles
+    const feed = document.getElementById('poll-events');
+    const es = new EventSource('/poll/events');
+    es.onmessage = (e) => {
+      const evt = JSON.parse(e.data);
+      if (evt.type === 'claimed') {
+        const div = document.createElement('div');
+        div.className = 'event-claimed';
+        div.textContent = `✓ Claimed ${evt.key} — ${evt.title}`;
+        feed.prepend(div);
+        setTimeout(() => location.reload(), 1000);
+      }
+    };
+  </script>
 </body>
 </html>
