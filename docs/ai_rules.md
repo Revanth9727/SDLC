@@ -136,15 +136,18 @@ Because diagnosis happens before human approval (possibly much earlier), verify 
 target files haven't changed since diagnosis before the Executor edits. If the repo
 moved, re-diagnose or flag — don't edit a stale codebase.
 
-**R-25. Jira status is dynamic, config-mapped, and non-blocking.**
-Never hardcode Jira status names or transition IDs. Discover allowed transitions at
-runtime (Jira's transitions endpoint) from the ticket's *current* status; map internal
-stages (`in_progress`, `awaiting_approval`, `in_review`, `blocked`, `done`) to status
-names via config, with optional fallbacks. Match case-insensitively. If no matching
-transition exists in the project's workflow, log a warning and continue — a status
-update must NEVER raise, block, or fail the actual work (this is R-11 applied to
-status). The Orchestrator triggers `set_status` at each stage boundary; it is a
-deterministic tool call, never an agent decision.
+**R-25. Jira status is dynamic and category-based; setting status is non-blocking.**
+Never hardcode a full status-name mapping. Jira exposes every status with a
+statusCategory (`new`=To Do, `indeterminate`=In Progress, `done`=Done); the app fetches
+the project's statuses+categories from Jira and buckets by **category**, so ANY custom
+status (On-Hold, Parking Lot, QA Review) is classified correctly with no `.env` editing.
+"Ready to pick up" = category `new`; "active" = `indeterminate`; "finished" = `done`.
+For status changes the app *performs* (claim→In Progress, PR→In Review), resolve the
+target by category (optionally a configured name override when a category has several
+statuses), and skip silently if none is available — a status update must NEVER raise,
+block, or fail the actual work (R-11). Only a status whose category can't be resolved at
+all counts as "unknown" and escalates. The Orchestrator triggers transitions; they are
+deterministic tool calls, never agent decisions.
 
 **R-26. The target repo comes from the ticket, resolved then confirmed — never hardcoded.**
 There is no single global repo. Before planning, a deterministic repo-resolver runs a
@@ -167,6 +170,117 @@ polls overlap. A poll must not re-enter while the previous cycle runs. A ticket
 In Progress in Jira with no active local run is orphaned and flagged for a human, never
 silently stuck (R-11). Multiple ready tickets are processed sequentially until true
 parallelism is enabled (Phase 10).
+
+**R-28. The supervisor: Jira is the source of truth; escalation cannot fail.**
+The app is a supervisor watching tickets continuously; the DB is a cache, never an
+excuse to stop checking Jira. Each cycle it reconciles tickets in scope (active runs +
+Jira tickets updated since last sweep) against real Jira status: back-in-To-Do →
+un-claim and re-pick; moved-to-Done/blocked → stop the AI run; human-driven In Progress
+→ don't double-claim; a **reopened** long-closed ticket → treat as active again, never
+error because it was closed; a status with NO config mapping (unknown) → escalate +
+flag needs_human, never silently ignore. Ownership = "is there an active AI run?"
+Reconciliation and commenting read ONLY the subject ticket's own record and history —
+never another ticket's data. Before ANY comment, read the ticket's history and state
+what's actually done. **Escalation must never fail on missing config:** always post a
+comment, always @mention the owner (assignee else reporter), TRY to set a human/blocked
+status but skip silently if unmapped (R-25), email deferred — even with every status
+missing, comment + @mention reach a human. Stuck In Progress beyond
+`STUCK_THRESHOLD_MINUTES`: AI-owned → history-aware "what completed / where stuck"
+comment (no status change); human-owned → "what's blocking?" comment; healthy run →
+never nag; once per episode. Push signal is To Do; reconciliation makes a drag-back or a
+reopen reliably re-trigger the supervisor.
+
+**R-29. Solution reuse is tiered — skip reasoning, never skip safety.**
+Before running the reasoning agents, memory searches top-K resolved tickets. On a strong
+match (similarity ≥ 0.9), skip Diagnosis and Step-Planner ONLY: take the past resolution
+as a proposed fix, run a freshness/applicability check, then STILL go through the human
+gate and Critic verification before the PR. Never blind-apply a past fix — a similar
+ticket is not a proven-correct fix, and the codebase may have changed. Weak/no match →
+full pipeline. The savings come from skipping heavy reasoning, not from skipping the gate
+or verification. Reuse reads only resolved-ticket summaries (isolation still holds).
+
+**R-30. Never change anything without a prior human gate; confirm intent first.**
+No state-changing action (code edit, PR, status forcing) happens without a preceding
+human approval, batched at the plan level (one meaningful approval per sub-task's plan —
+not a prompt per micro-action, which would be unusable). Additionally, when a ticket's
+intent is ambiguous, the Planner states its interpretation and asks the human to confirm
+BEFORE decomposition is trusted ("I read this as X and Y — correct?").
+
+**R-31. Validate the whole change as a team, not just each piece.**
+Sub-task isolation prevents hallucination but hides cross-impact (a frontend change
+breaking the backend). After all sub-tasks are individually complete and BEFORE any PR,
+an integration stage assembles the combined change across affected repos, runs the full
+test suite, and checks for cross-breakage. Pass → PR(s). Cross-breakage → escalate to the
+human with what broke; never ship a change that passes per-sub-task but fails as a whole.
+
+**R-32. A fix that can't be verified is escalated, never assumed safe.**
+Before trusting a change, check verifiability: if the repo has no tests, flag "no tests
+exist to verify this" at the human gate (weak-confidence signal) and optionally have the
+Executor write a test for its own change; if the change adds uncovered code, the Critic
+surfaces it. An unverifiable change is escalated to the human explicitly — never silently
+treated as safe.
+
+**R-33. Tier models by task difficulty — big model plans, cheap models execute.**
+Each agent's model is configured independently (extends R-18). The mechanism is
+**plan-then-execute**: the expensive model does the *reasoning* once — it searches,
+understands the code, and produces a spec detailed enough that a cheap model can execute
+it without needing to think or search. So the big model is reserved for reasoning that
+requires understanding (Diagnosis, ambiguous planning); cheap models do well-specified
+execution (applying a spec'd edit, simple parsing, routing, Step-Planner formatting).
+A **deterministic model router** (plain rules, NO LLM — task type → tier) decides which
+tier each task uses; not everything goes to the big model. No agent hardcodes a model —
+each reads its tier from config (`MODEL_CHEAP`, `MODEL_STRONG`, per-agent map). The
+quality bar shifts to **spec completeness**: the big model must hand over genuinely
+everything (exact locations, exact changes, expected outcome) so the cheap executor
+doesn't guess; the Critic + verification catch specs that were too thin. This is the
+single biggest cost lever after solution reuse.
+
+**R-34. Every ticket has an enforced cost/LLM-call budget.**
+Track LLM calls and estimated cost per ticket (and per sub-task), visible in the UI.
+A configurable ceiling (`TICKET_CALL_BUDGET`, `TICKET_COST_BUDGET_USD`) is enforced by
+the guard: on exceed, pause and escalate to the human ("this ticket has used X calls /
+$Y — continue?") rather than silently spending. This catches slow sprawl that never
+technically loops (complements R-8's loop caps). Minimise calls structurally too: prefer
+solution reuse (R-29), merge cheap sequential steps into one call where it doesn't hurt
+modularity, cap context to relevant slices, and cache stable prompt prefixes.
+
+**R-35. I/O is async; the supervisor handles tickets concurrently.**
+All external I/O (Jira, GitHub, OpenAI, DB) uses async (`async`/`await`, `httpx.AsyncClient`,
+async DB access). FastAPI is already async — extend it through the stack so the poller/
+supervisor can process independent tickets concurrently without blocking on one slow
+call. This delivers most of the concurrency benefit without a second language. (True
+parallel *agent* execution is still Phase 10; async is the I/O foundation under it.)
+
+**R-36. LLM response caching (built when agents exist, not before).**
+An exact + semantic response cache cuts repeat LLM cost: an `exact_cache` (SHA-256 of the
+prompt → response, an unlogged Postgres table) checked first, then a `semantic_cache`
+(pgvector, cosine ≥ ~0.92) for near-duplicates, before dispatching to a model. It lives
+IN the Python LLM client (same Postgres/pgvector already in use) — NO separate service,
+NO second language; a Go edge gateway is unnecessary at this scale (a hash+lookup is
+microseconds in Python). Because it caches LLM calls, it is built with the memory phase
+(Phase 9), once agents actually make those calls — building it earlier caches nothing.
+
+**R-37. Event-driven fast path via webhooks (Python), polling stays the fallback.**
+GitHub (PR opened/merged/closed) and Jira (status change) webhooks are received by
+FastAPI endpoints — no separate service, no Go (a webhook is an HTTP POST Python handles
+natively). Enforce idempotency by delivery ID (drop duplicates). Extract the Jira key
+from PR title/branch/commits and maintain a PR↔ticket linkage table. Webhooks and the
+polling supervisor reconcile into the SAME state/status logic: webhooks make it fast,
+polling guarantees nothing is missed. Ticket/PR transitions follow the PR-state matrix
+(architecture.md §5b): a reopened ticket whose linked PR is MERGED never un-merges the PR
+(immutable history) — it comments that a new PR is needed; open/closed-unmerged PRs get
+context comments. Built after PRs exist. A Go edge receiver is a future option only if
+webhook volume becomes a measured bottleneck.
+
+**R-38. The human gate can be answered by comment — with a permission check.**
+Approval works from two channels driving the SAME gate/resume: the UI button and a Jira
+comment reply ("APPROVE"/"REJECT"). A `pending_approvals` record tracks each gate's
+lifecycle so approving one action never triggers another. Comment handling: ignore
+anything not starting with APPROVE/REJECT (noise prevention), and REQUIRE a permission
+check — only the assignee or a configured allow-list/role may approve; an unauthorised
+reply is refused, never actioned (an approval anyone can trigger is not an approval, and
+this is R-30's "the right human asks" made concrete). Both channels resume via the same
+path; never double-apply.
 
 ---
 

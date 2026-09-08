@@ -18,6 +18,7 @@ from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
 from app import events as ev
+from app.core.ownership import owner_of_key
 from app.core.poller import poll_cycle, start_loop
 from app.db.connection import SessionLocal
 from app.db.models import Ticket, TicketEvent
@@ -97,6 +98,45 @@ def debug_jira() -> JSONResponse:
     return JSONResponse(content=issues)
 
 
+@app.get("/debug/jira/statuses", response_class=JSONResponse)
+def debug_jira_statuses() -> JSONResponse:
+    """Temporary: show Jira project statuses exactly as resolved from Jira."""
+    try:
+        statuses = JiraTool().fetch_project_statuses(
+            force_refresh=True,
+            timeout_seconds=5,
+        )
+    except Exception as exc:
+        logger.exception("debug_jira_statuses failed")
+        return JSONResponse(
+            status_code=502,
+            content={"error": "jira_status_fetch_failed", "detail": str(exc)},
+        )
+    return JSONResponse(content={"statuses": statuses})
+
+
+@app.get("/debug/jira/category/{key}", response_class=JSONResponse)
+def debug_jira_category(key: str) -> JSONResponse:
+    """Temporary: show a Jira ticket's current status and resolved category."""
+    try:
+        jira = JiraTool()
+        issue = jira.get_issue(key)
+        category = issue.get("status_category") or jira.status_category(issue["status"])
+    except Exception as exc:
+        logger.exception("debug_jira_category failed for %r", key)
+        return JSONResponse(
+            status_code=502,
+            content={"error": "jira_category_fetch_failed", "key": key, "detail": str(exc)},
+        )
+    return JSONResponse(
+        content={
+            "key": key,
+            "status": issue["status"],
+            "category": category,
+        }
+    )
+
+
 @app.get("/debug/github", response_class=JSONResponse)
 def debug_github() -> JSONResponse:
     """Temporary: return repo name and default branch from GitHub."""
@@ -114,6 +154,12 @@ def debug_jira_status(body: _StatusRequest) -> JSONResponse:
     """Temporary: move a Jira issue to the given internal stage and return the result."""
     result = JiraTool().set_status(body.key, body.stage)
     return JSONResponse(content=result)
+
+
+@app.get("/debug/ownership/{key}", response_class=JSONResponse)
+def debug_ownership(key: str) -> JSONResponse:
+    """Temporary: classify who owns a Jira ticket: ai, human, or none."""
+    return JSONResponse(content=owner_of_key(key))
 
 
 @app.post("/ticket/{key}/resolve-repos", response_class=JSONResponse)

@@ -4,12 +4,14 @@ Each cycle (every settings.jira_poll_interval_minutes):
   1. Overlap guard: skip tick if previous cycle still running.
   2. Reconcile: check every in-scope ticket against Jira truth (R-28, §5b).
      Fixes drift BEFORE claiming so cleared claims are re-picked this cycle.
-  3. Fetch Jira issues in status "To Do" (the ready signal).
-  4. For each, CLAIM atomically BEFORE any work:
+  3. Stuck detection: post history-aware Jira comments for active-category tickets
+     older than STUCK_THRESHOLD_MINUTES (R-28); deduped per episode.
+  4. Fetch Jira issues whose status category is "new" (the ready signal).
+  5. For each, CLAIM atomically BEFORE any work:
        a. skip if tickets.claimed_at is already set
        b. insert/mark the ticket row with claimed_at = now
        c. flip Jira status to in_progress via JiraTool.set_status (R-25)
-  5. Emit a structured event per claimed ticket.
+  6. Emit a structured event per claimed ticket.
 
 Real agent processing (Planner etc.) is wired in later phases; "process" here
 means: persist the record and emit the event. Sequential for now (Phase 10 adds
@@ -29,6 +31,7 @@ from app.db.connection import SessionLocal
 from app.db.models import Ticket
 from app.events import log_event as ev_log
 from app.core.reconcile import reconcile
+from app.core.stuck import check_stuck
 from app.tools.jira_tool import JiraTool
 
 logger = logging.getLogger(__name__)
@@ -36,7 +39,7 @@ logger = logging.getLogger(__name__)
 # Overlap guard — held for the duration of a running cycle.
 _RUNNING = asyncio.Lock()
 
-_JIRA_TODO_STATUS = "To Do"
+_CATEGORY_READY = "new"
 
 
 # ---------------------------------------------------------------------------
@@ -65,8 +68,8 @@ async def start_loop(emit: Callable[[dict], Awaitable[None]]) -> asyncio.Task:
             "poller: loop started — interval=%d min", settings.jira_poll_interval_minutes
         )
         while True:
-            await poll_cycle(emit)
             await asyncio.sleep(interval)
+            await poll_cycle(emit)
 
     return asyncio.create_task(_loop(), name="jira_poller")
 
@@ -77,6 +80,7 @@ async def start_loop(emit: Callable[[dict], Awaitable[None]]) -> asyncio.Task:
 
 async def _do_poll(emit: Callable[[dict], Awaitable[None]]) -> list[dict]:
     jira = JiraTool()
+    jira.fetch_project_statuses(force_refresh=True)
 
     # Step 2: reconcile drift BEFORE claiming (R-28).
     # Runs inside the overlap guard so it never races with itself.
@@ -87,14 +91,20 @@ async def _do_poll(emit: Callable[[dict], Awaitable[None]]) -> list[dict]:
     except Exception as exc:
         logger.error("poller: reconcile raised unexpectedly: %s", exc)
 
-    # Step 3: fetch and claim new "To Do" tickets.
+    # Step 3: stuck detection — post informed comments; never changes Jira status.
     try:
-        issues = jira.list_by_status(_JIRA_TODO_STATUS)
+        await check_stuck(jira, emit)
+    except Exception as exc:
+        logger.error("poller: check_stuck raised unexpectedly: %s", exc)
+
+    # Step 4: fetch and claim ready-category tickets.
+    try:
+        issues = jira.list_by_category(_CATEGORY_READY)
     except Exception as exc:
         logger.error("poller: jira query failed: %s", exc)
         return []
 
-    logger.info("poller: found %d '%s' issues", len(issues), _JIRA_TODO_STATUS)
+    logger.info("poller: found %d ready-category issue(s)", len(issues))
     claimed: list[dict] = []
     for issue in issues:
         event = await _claim_one(jira, issue)
@@ -119,10 +129,12 @@ async def _claim_one(jira: JiraTool, issue: dict) -> dict | None:
 
     with SessionLocal() as db:
         # Step A: claim an existing unclaimed ticket.
+        # Reset status to 'new' so re-claimed tickets (previously superseded /
+        # needs_human) start clean — not with their prior lifecycle status.
         upd = db.execute(
             sa_update(Ticket)
             .where(Ticket.external_key == key, Ticket.claimed_at.is_(None))
-            .values(claimed_at=now)
+            .values(claimed_at=now, status="new", last_stuck_comment_at=None)
             .returning(Ticket.id)
         )
         row = upd.first()

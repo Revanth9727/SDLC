@@ -100,7 +100,7 @@ Jira ticket (status "To Do")
 [Jira POLLER]  (every N min; claims only "To Do" tickets, flips to In Progress)
    │
    ▼
-[RESOLVE REPOS]  (deterministic cascade + confirm gate — §5b)
+[RESOLVE REPOS]  (deterministic cascade + confirm gate — §5c)
    │
    ▼
 PLANNER ──► splits into isolated sub-tasks + dependency graph
@@ -111,12 +111,17 @@ ORCHESTRATOR ──► picks next ready sub-task (parallel where independent)
    │
    │   ┌─────────── per sub-task, in ISOLATED state ───────────┐
    │   │                                                        │
-   │   │  DIAGNOSIS ─► reads repo (tool), writes root_cause     │
-   │   │      │                                                 │
-   │   │      ▼                                                 │
-   │   │  STEP-PLANNER ─► writes ordered steps                  │
-   │   │      │                                                 │
-   │   │      ▼                                                 │
+   │   │  MEMORY REUSE GATE ─► search resolved tickets;         │
+   │   │      │  strong match (≥0.9)? → skip Diagnosis+Step-     │
+   │   │      │  Planner, propose known fix → human gate         │
+   │   │      │  (else fall through) ──────────────┐            │
+   │   │      ▼                                     │            │
+   │   │  DIAGNOSIS ─► reads repo (tool), root_cause│            │
+   │   │      │                                     │            │
+   │   │      ▼                                     │            │
+   │   │  STEP-PLANNER ─► writes ordered steps      │            │
+   │   │      │                                     │            │
+   │   │      ▼◄────────────────────────────────────┘            │
    │   │  HUMAN GATE ─► post plan+reasoning to Jira, PAUSE      │
    │   │      │  (checkpointed; resumes on approval)            │
    │   │      ▼                                                 │
@@ -133,6 +138,10 @@ ORCHESTRATOR ──► picks next ready sub-task (parallel where independent)
    │   │  [Memory write-back] ─► store resolution          │    │
    │   └───────────────────────────────────────────────────────┘
    │                    │  (N rejects → escalate to human)
+   │                    ▼
+   │            [INTEGRATION STAGE]  (§7b — after all sub-tasks done,
+   │             before PR: assemble combined change, run FULL tests,
+   │             catch cross-breakage; else escalate)
    ▼                    ▼
 next sub-task …      done → final report on the ticket
 ```
@@ -189,7 +198,7 @@ Two rules about this object:
 
 The Planner also has a small **TicketState** (the only thing that sees all sub-tasks):
 `{ticket_id, raw_ticket, resolved_repos[], subtasks[], dependency_graph, overall_status}`.
-`resolved_repos` is the confirmed list from §5b, which the Planner assigns across
+`resolved_repos` is the confirmed list from §5c, which the Planner assigns across
 sub-tasks.
 
 ---
@@ -227,7 +236,105 @@ state), so **true parallelism is enabled in Phase 10**. This is the first place
 parallelism applies: whole independent tickets. (The second is independent sub-tasks
 within a ticket — also Phase 10.)
 
-## 5b. Repo resolution (which codebase does this ticket touch?)
+## 5b. The Supervisor: Jira is the source of truth
+
+The app is a **supervisor** that watches tickets continuously, not just an intake that
+grabs To Do items. The DB is a **cache**, not the truth. Jira status is the human's
+control surface, so **every cycle the supervisor reconciles** the tickets it should be
+watching against their real Jira status — the DB never lets the app stop re-checking
+Jira. This fixes the core flaw where a ticket already in the DB is ignored even after a
+human changes it.
+
+**Sweep scope (robust to reopens, not a full-history rescan).** Each cycle the
+supervisor considers: tickets with an active local run, plus any Jira ticket **updated
+since the last sweep**. Key property: a ticket resolved long ago that gets **reopened**
+changes its Jira updated-time/status, so it re-enters scope automatically and is handled
+as active again — the app never fails or goes blind on a reopen, without the cost of
+rescanning every historical ticket every cycle.
+
+**Reconciliation (for each ticket in scope, any status):**
+re-read the ticket's real Jira status and resolve the drift:
+- Claimed locally but back in **To Do** (human reset it) → clear the local claim,
+  re-pick it.
+- App is working it but human moved it to **Done/blocked** → the human overrode →
+  stop the AI run.
+- Human moved **To Do → In Progress** manually → detect it's human-driven, don't
+  double-claim.
+- A previously-resolved ticket now **reopened** → treat as active again; never error
+  because it was closed before.
+- **Unknown status** (a Jira status with NO mapping in config) → the app can't
+  interpret it → escalate (see the nudge cascade below) AND flag the ticket
+  `needs_human`. Never silently ignore a status it doesn't understand.
+- Status matches expectation → nothing to do.
+
+**Escalation that cannot fail (the nudge cascade).** Escalation must NOT depend on any
+Jira status existing. When a ticket needs human attention (stuck, unknown status,
+unrecoverable), the supervisor: (1) ALWAYS posts a Jira comment (works regardless of
+workflow config); (2) **@mentions the owner** (assignee, else reporter) so a human is
+notified; (3) TRIES to set a human/blocked status but skips silently if it's not mapped
+(R-25); (4) email notification is deferred. Even if every status mapping is missing, the
+comment + @mention still reach a human — a ticket never falls silently through a crack.
+
+**Per-ticket isolation is absolute here.** Reconciliation and commenting read ONLY the
+subject ticket's own DB record and event history — never another ticket's data. No
+cross-ticket query, ever. (This extends the sub-task isolation guarantee to the
+reconciliation layer.)
+
+**Informed comments (read history first).** Before writing ANY comment on a ticket,
+load that ticket's own event history, determine what stage it actually reached and what
+happened, and word the comment to reflect reality (e.g. "diagnosis done; stuck applying
+the fix at step 3") — never a generic "blocked." The same history read is used when
+re-picking a ticket, so completed work is not redone.
+
+**Who's-in-control detection.** Before acting on any ticket, determine ownership by one
+check: **is there an active AI run for it in the DB?** Active run → AI owns it. No
+active run but In Progress → a human owns it. This single check arbitrates every
+human-vs-AI decision.
+
+**Stuck detection + smart comment.** A ticket In Progress longer than
+`STUCK_THRESHOLD_MINUTES` (configurable) is examined by ownership, AFTER reading its
+history:
+- **AI-owned and wedged** → comment stating what was completed and where it stuck (do
+  NOT change the Jira status — respect the human's board); @mention the owner.
+- **Human-owned and stalled** → comment asking the human what's blocking, referencing
+  what's already been done; @mention the owner.
+- **Healthy in-flight AI run** → never nag.
+- **Comment once per stuck episode** — don't repeat until the situation changes.
+
+The push signal stays **To Do** — reconciliation is what makes a human dragging a ticket
+back to To Do (or reopening a closed one) reliably re-trigger the supervisor.
+
+**Event-driven fast path (webhooks) — the supervisor's other input.** Polling is the
+reliable *fallback*; **webhooks** are the *fast path* that reacts instantly:
+- **GitHub** fires on PR opened/merged/closed; **Jira** fires on issue status change.
+- Received by **Python/FastAPI webhook endpoints** (no separate service, no Go — a
+  webhook is an HTTP POST FastAPI handles natively).
+- **Idempotency:** each delivery carries an ID (`X-GitHub-Delivery` / Jira delivery id);
+  check it against the DB and drop duplicates (webhooks can fire twice).
+- **Key extraction:** parse the Jira issue key from PR title/branch/commits
+  (`(?i)[A-Z]{2,10}-\d+`) to link a PR to its ticket.
+- **PR↔ticket linkage table:** map `github_pr_id → jira_issue_key` with the PR's state.
+
+Webhooks and polling reconcile into the **same** state/status logic — webhooks make it
+fast, polling guarantees nothing is missed. Built after PRs exist (see the phased build).
+If webhook volume ever becomes a *measured* bottleneck, a lightweight Go edge receiver is
+a future option — not a present need.
+
+**PR-state matrix (how ticket/PR transitions resolve):**
+
+| Event | Source | Condition | Action |
+|-------|--------|-----------|--------|
+| PR opened | GitHub | branch/PR names the key | link PR; move ticket To Do→In Progress; comment "PR #N opened" |
+| PR merged | GitHub | linked to key | mark link DONE; move ticket → Resolved/Done |
+| Ticket reopened | Jira | Done→active AND linked PR **merged** | do NOT reopen the PR (merged is immutable); comment "reopened, but PR #N already merged — new PR likely needed" |
+| Ticket reopened | Jira | linked PR **closed-unmerged** | leave PR closed; post context comment |
+| Ticket reopened | Jira | linked PR **open** | comment on the PR "ticket moved back to In Progress" |
+| Branch deleted / PR closed no-merge | GitHub | — | mark link ABANDONED; context comment on ticket |
+
+This refines the supervisor's generic "reopened → active" into precise handling of the
+ticket's *existing PR*.
+
+## 5c. Repo resolution (which codebase does this ticket touch?)
 
 A ticket does not carry its target repo in a fixed field, and a single ticket may
 touch **multiple repos**. So before the Planner can decompose, the system must resolve
@@ -263,7 +370,7 @@ per-sub-task `repo` field in §5). Repo assignment is part of the Planner's exis
 reasoning — there is no separate repo-matching agent. If a sub-task's repo is
 ambiguous, the Planner flags it at the gate rather than guessing (R-10).
 
-## 5c. Jira status sync (keeping the board honest)
+## 5d. Jira status sync (keeping the board honest)
 
 The Jira ticket is what humans watch, so the system keeps its **status** in sync with
 where the work actually is — a production requirement, not a nicety. This is a
@@ -280,19 +387,23 @@ Orchestrator at stage boundaries.
 | Guard escalation / cannot proceed | `blocked` | Blocked |
 | Completed | `done` | Done |
 
-**Dynamic, not hardcoded (the key design choice).** Jira workflows are project-specific
-and only allow *configured* transitions from the current status. So the system:
+**Dynamic, category-based (the key design choice).** Jira workflows are project-specific,
+and users add/rename statuses freely — so the app must NOT depend on a hardcoded
+status-name map. Every Jira status carries a **statusCategory** (`new`=To Do,
+`indeterminate`=In Progress, `done`=Done). The system:
 
-1. **Discovers** allowed transitions at runtime from the ticket's current status (Jira's
-   transitions endpoint) — never assumes the full workflow.
-2. **Maps** internal stages to status *names* via config (env), with optional fallbacks,
-   matched case-insensitively.
-3. **Degrades gracefully** — if a mapped status doesn't exist in the project's workflow,
-   it logs a warning and continues. A status update NEVER blocks or fails the real work
-   (see `ai_rules.md` R-25, which is R-11 applied to status).
+1. **Fetches** the project's statuses + categories from Jira (cached, refreshed per
+   cycle) and **buckets by category** — so any custom status (On-Hold, Parking Lot, QA
+   Review) is classified correctly with zero `.env` editing.
+2. **Reads** ticket state by category: `new`→ready-to-pick-up, `indeterminate`→active,
+   `done`→finished.
+3. **Sets** status by resolving the target category to an available transition (with an
+   optional name override when a category has several statuses), skipping silently if
+   none exists — a status update NEVER blocks or fails the real work (R-25 / R-11).
+4. Treats only a status with an **unresolvable category** as "unknown" → escalate.
 
-This means the same code works across standard and custom Jira workflows with only
-config changes, and a mis-mapped status is a harmless warning, not an outage.
+This means the same code works across standard and custom Jira workflows with no config
+changes, and the user never hand-maps statuses.
 
 ## 6. The guard (how failure-exit and contracts are enforced)
 
@@ -329,6 +440,88 @@ continue-or-escalate.** No agent output is trusted until the guard passes it.
   context.
 
 Memory is detailed in `memory.md`.
+
+---
+
+## 7a. Intent confirmation (understand before decomposing)
+
+A ticket can ask for many things, and its intent can be ambiguous ("the login is
+weird"). Before the Planner's decomposition is trusted, it **states its interpretation
+and asks the human**: "I read this as 2 tasks — fix the auth bug + restyle the button.
+Correct?" Only on confirmation does it proceed. This is an **intent-confirmation gate**
+at the very front of the flow (after repo resolution, before/with decomposition). It
+enforces the broader principle: **the system never changes anything without first
+confirming with the human** — batched at the plan level so it stays usable, not a
+prompt per micro-action.
+
+## 7b. Cross-sub-task integration (agents as a team)
+
+Sub-task isolation prevents hallucination, but it also means sub-task A (frontend) has
+no idea it may have broken sub-task B (backend). So after all sub-tasks in a ticket are
+individually complete — but **before any PR** — an **integration stage** (owned by the
+Orchestrator) assembles the *combined* change across affected repos, runs the **full**
+test suite, and checks for cross-breakage. The team guarantee: the whole change is
+validated as one, not just each piece in isolation.
+- All integrated checks pass → proceed to PR(s).
+- Cross-breakage detected → escalate to the human with what broke, rather than shipping
+  a change that passes per-sub-task but fails as a whole.
+
+This is the one place the isolated pieces are deliberately viewed together. It only
+exists once a ticket has multiple sub-tasks, so it is built with multi-sub-task support
+(Phase 8).
+
+## 7c. Verifiability (no tests / no CI)
+
+A fix is only trustworthy if it can be verified. Before trusting any change:
+- **Does the target repo have tests?** If not, the fix cannot be meaningfully verified
+  → flag "no tests exist to verify this" at the human gate (honest weak-confidence
+  signal), and optionally have the Executor **write a test** covering its own change.
+- **Did the change add code with no coverage?** The Critic surfaces it.
+An unverifiable change is never silently treated as safe — it is escalated to the human
+explicitly. (This is R-11 / "always ask" applied to verification.)
+
+---
+
+## 7d. Cost & efficiency (fewer, cheaper calls)
+
+The pipeline can make 10-20+ LLM calls per sub-task, so cost and latency are
+first-class design concerns, controlled by:
+
+- **Model tiering (biggest lever after reuse).** The mechanism is **plan-then-execute**:
+  the expensive model does the reasoning *once* — searches, understands the code, and
+  emits a spec detailed enough that a cheap model executes it without thinking or
+  searching. Big model = reasoning that needs understanding (Diagnosis, ambiguous
+  planning); cheap models = well-specified execution (applying a spec'd edit, parsing,
+  routing, Step-Planner formatting). A **deterministic model router** (plain rules, no
+  LLM: task type → tier) decides the tier per task — not everything goes to the big
+  model. Configured per-agent (R-33). Typically cuts cost 60-80%. The quality bar moves
+  to *spec completeness*: the big model must hand over exact locations/changes/expected
+  outcome so the cheap executor never guesses; the Critic backstops thin specs.
+- **Solution reuse (R-29).** A strong memory match skips Diagnosis + Step-Planner
+  entirely — the two most expensive calls avoided outright.
+- **Per-ticket budget (R-34).** Calls and estimated cost are tracked and capped per
+  ticket; on exceed the guard pauses and asks the human rather than spending silently.
+- **Structural minimisation.** Merge cheap sequential steps into single calls where it
+  doesn't hurt modularity; send only relevant code slices, not whole files (the
+  blackboard already passes structured fields, not transcripts); cache stable prompt
+  prefixes.
+
+The tension to respect: tier by *difficulty* (a too-cheap model on a hard job hurts
+quality — the Critic is the backstop), and don't over-merge agents (you lose the
+isolation and debuggability that make the system reviewable).
+
+**Async I/O (concurrency without a second language).** All external I/O (Jira, GitHub,
+OpenAI, DB) is async, so the poller/supervisor processes independent tickets concurrently
+without blocking on one slow call (R-35). This is the I/O foundation under the true
+parallel agent execution added in Phase 10 — and it captures most of the concurrency
+benefit people reach to Go for, in the Python stack you already have.
+
+**LLM response caching (Phase 9, when there's traffic to cache).** A two-tier cache —
+exact (SHA-256 → response) then semantic (pgvector, cosine ≥ ~0.92) — checked before any
+model dispatch, cuts repeat cost hard. It lives inside the Python LLM client using the
+same Postgres/pgvector already present; no separate service and no Go gateway (a
+hash+lookup is microseconds in Python). Built with the memory phase because it can only
+cache calls once the agents make them (R-36).
 
 ---
 
@@ -372,7 +565,10 @@ files (JSON/YAML/TOML); script-generation for very large (>1000-line) files.
   guard, or pauses at a gate, an event streams to the browser so you watch the
   trajectory in real time.
 - **The human gate** appears in the UI (and as a Jira comment): the plan + reasoning,
-  with approve/reject. Approving resumes the checkpointed flow.
+  with approve/reject. It can be answered from **two channels** — the UI button, or a
+  Jira **comment reply** ("APPROVE"/"REJECT") that a permission check gates to the
+  assignee/allowed users only (R-38). Both drive the same checkpointed resume; noise and
+  unauthorised replies are ignored. Approving resumes the flow.
 - Because state is checkpointed, you can refresh, close the tab, or restart the
   server and the run continues from where it paused.
 

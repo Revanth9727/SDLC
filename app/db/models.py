@@ -36,6 +36,9 @@ class Ticket(Base):
     claimed_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True), nullable=True, default=None
     )  # set atomically by the poller when it claims this ticket; None = unclaimed
+    last_stuck_comment_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True, default=None
+    )  # when the last stuck-episode comment was posted; None = not yet commented this episode
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,

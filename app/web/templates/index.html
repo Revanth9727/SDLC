@@ -157,7 +157,7 @@
         const res = await fetch('/poll/run-once', { method: 'POST' });
         const data = await res.json();
         const n = data.claimed.length;
-        status.textContent = n ? `claimed ${n} ticket(s)` : 'no new To Do tickets found';
+        status.textContent = n ? `claimed ${n} ticket(s)` : 'no ready-category tickets found';
         if (n) setTimeout(() => location.reload(), 1500);
       } catch (err) {
         status.textContent = 'error — see server logs';

@@ -171,14 +171,23 @@ DATABASE_URL=postgresql://agentic:localdevpassword@localhost:5432/agentic_sdlc
 
 # --- OpenAI ---
 OPENAI_API_KEY=sk-REPLACE_ME
-OPENAI_MODEL=gpt-4o                 # swappable; see agent_context.md
+OPENAI_MODEL=gpt-4o                 # default/fallback model
+
+# --- Model tiering (cost control; per-agent difficulty) ---
+MODEL_STRONG=gpt-4o                 # hard reasoning: Diagnosis, Executor, Critic
+MODEL_CHEAP=gpt-4o-mini             # easy jobs: intent, routing, Step-Planner, parsing
+OPENAI_EMBED_MODEL=text-embedding-3-small   # memory embeddings (dim 1536)
+
+# --- Per-ticket budget (enforced; guard pauses + asks on exceed) ---
+TICKET_CALL_BUDGET=40               # max LLM calls per ticket before escalation
+TICKET_COST_BUDGET_USD=2.00         # max estimated spend per ticket before escalation
 
 # --- GitHub ---
 GITHUB_TOKEN=github_pat_REPLACE_ME
 GITHUB_OWNER=your-github-username
 # GITHUB_REPO is the SANDBOX repo for local testing only. In real runs the target
 # repo(s) are resolved from the ticket (web links/description) and confirmed by you —
-# never hardcoded. See architecture.md §5b and ai_rules.md R-26.
+# never hardcoded. See architecture.md §5c and ai_rules.md R-26.
 GITHUB_REPO=agentic-sdlc-sandbox
 
 # --- Jira ---
@@ -187,19 +196,29 @@ JIRA_EMAIL=you@example.com
 JIRA_API_TOKEN=REPLACE_ME
 JIRA_PROJECT_KEY=SANDBOX
 
-# --- Jira status mapping (dynamic; match YOUR project's workflow names) ---
-# Internal stage -> the Jira status NAME to transition to. Leave blank to skip a stage.
-# The system discovers allowed transitions at runtime and matches these names
-# case-insensitively; a name not in your workflow is skipped with a warning (never crashes).
-JIRA_STATUS_IN_PROGRESS=In Progress
-JIRA_STATUS_AWAITING_APPROVAL=Awaiting Approval
-JIRA_STATUS_IN_REVIEW=In Review
-JIRA_STATUS_BLOCKED=Blocked
-JIRA_STATUS_DONE=Done
+# --- Jira status (DYNAMIC / category-based — usually leave these blank) ---
+# The app fetches your project's statuses + categories from Jira and buckets by
+# category (To Do / In Progress / Done) automatically — no need to map status names.
+# These OPTIONAL overrides only matter if a category has several statuses and you want
+# the app to target a SPECIFIC one when it sets status. Leave blank to auto-pick.
+JIRA_STATUS_IN_PROGRESS=
+JIRA_STATUS_IN_REVIEW=
+JIRA_STATUS_DONE=
 
 # --- Jira polling (scheduled intake) ---
 # How often to poll Jira for new "To Do" tickets to pick up. Default 30.
 JIRA_POLL_INTERVAL_MINUTES=30
+
+# --- Reconciliation / stuck detection ---
+# A ticket In Progress longer than this is examined (AI-owned -> comment it's blocked;
+# human-owned -> comment asking what's blocking). Default 120 (2 hours).
+STUCK_THRESHOLD_MINUTES=120
+
+# --- Webhooks (event-driven fast path; Phase 5.5) ---
+# Shared secrets to verify inbound webhooks are genuine. Set these when you register
+# the webhooks in GitHub/Jira. Use smee.io or ngrok to expose localhost during dev.
+GITHUB_WEBHOOK_SECRET=REPLACE_ME
+JIRA_WEBHOOK_SECRET=REPLACE_ME
 EOF
 
 git add .env.example docker-compose.yml .gitignore

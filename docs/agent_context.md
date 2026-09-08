@@ -73,6 +73,29 @@ claimed twice even across overlapping polls. Multiple ready tickets run sequenti
 now; true parallelism (independent whole tickets, then independent sub-tasks) is
 Phase 10.
 
+## Supervisor: Jira is the truth (R-28)
+
+The app is a SUPERVISOR watching tickets continuously; the DB is a cache, not the truth.
+Each cycle it reconciles tickets in scope (active runs + Jira tickets updated since last
+sweep — so a REOPENED old ticket re-enters automatically, never errors). Drift handling:
+back-to-To-Do → un-claim + re-pick; moved-to-Done/blocked → stop AI run; reopened → treat
+active again; unknown status (not in config) → escalate + needs_human. Ownership = "is
+there an active AI run?" ISOLATION absolute: only that ticket's own row + history, never
+another's. Comments are history-aware (state what's actually done). ESCALATION CANNOT
+FAIL: always comment + @mention owner; try-and-skip status; email deferred — a ticket
+never falls through a crack. Stuck past `STUCK_THRESHOLD_MINUTES` → one history-aware
+comment @mentioning owner (AI: no status change; human: "what's blocking?"); never nag a
+healthy run. Built in Phase 2.5.
+
+## Webhooks: event-driven fast path (R-37)
+
+Polling is the fallback; webhooks are the fast path. FastAPI endpoints receive
+GitHub/Jira webhooks (Python, no Go), idempotent by delivery id, extract the Jira key
+from PR title/branch/commits, keep a PR↔ticket linkage table. Both webhooks + polling
+reconcile into the SAME logic. PR-state matrix: reopened ticket + MERGED PR → never
+un-merge, comment "new PR needed"; open/closed PRs → context comments. Built Phase 5.5
+(after PRs exist). Go edge receiver only if webhook volume is a measured bottleneck.
+
 ## Repo resolution (R-26)
 
 A ticket's target repo is NOT hardcoded and a ticket may touch multiple repos. A
@@ -102,7 +125,43 @@ fields only.
 9. Secrets from env only, never logged; model swappable via `OPENAI_MODEL` (R-17, R-18)
 10. Never touch main — branch + PR only; freshness-check before editing (R-19, R-20)
 
-## Build discipline
+## Solution reuse (R-29)
+
+Before the reasoning agents, memory searches top-K resolved tickets. Strong match
+(similarity ≥ 0.9) → SKIP Diagnosis + Step-Planner: propose the past fix, freshness-check
+it, then STILL run human gate + Critic + PR. Never blind-apply (similar ≠ proven; code may
+have changed). Weak/no match → full pipeline. Saves heavy reasoning, never safety. Built
+in Phase 7.5 (after full flow works, so resolved tickets exist to match).
+
+## Intent, integration, verifiability (R-30/31/32)
+
+- **Intent gate (R-30):** never change anything without a prior human gate (batched per
+  plan, not per keystroke). Planner states its reading + asks before decomposing. Phase 7.
+- **Integration stage (R-31):** sub-tasks are isolated, so after all are done and BEFORE
+  any PR, assemble the combined change, run the FULL suite, catch cross-breakage (frontend
+  breaking backend). Break → escalate, no PR. Phase 8.
+- **Verifiability (R-32):** no tests in a repo → a fix can't be verified → flag at the gate,
+  optionally write a test; Critic surfaces uncovered changes. Never assume safe. Phase 7.
+
+## Cost & efficiency (R-33/34)
+
+Many LLM calls per sub-task = real cost. Levers: (1) **Model tiering (R-33)** via
+**plan-then-execute**: the STRONG model reasons ONCE and emits a spec detailed enough
+that CHEAP models execute without searching/thinking (big=Diagnosis/ambiguous planning/
+Critic; cheap=spec'd edit apply, parsing, routing, Step-Planner). A DETERMINISTIC router
+(rules, no LLM: task type→tier) decides the tier — not everything goes to the big model.
+Per-agent tier from config (`MODEL_CHEAP`/`MODEL_STRONG`), no hardcoded models — biggest
+lever after reuse. Quality bar = spec completeness (Critic backstops thin specs).
+(2) **Solution reuse (R-29)** skips the two priciest agents. (3) **Per-ticket budget
+(R-34)** — track calls + cost, cap via `TICKET_CALL_BUDGET`/`TICKET_COST_BUDGET_USD`;
+guard pauses + asks on exceed. (4) Structural: merge cheap steps, slice context, cache
+prompt prefixes.
+
+**Async (R-35):** all external I/O (Jira/GitHub/OpenAI/DB) is async so the supervisor
+handles tickets concurrently without blocking — Python, no Go. Build from Phase 2.5 on.
+**LLM cache (R-36):** exact (hash) + semantic (pgvector ≥0.92) cache inside the Python
+LLM client, same Postgres — no separate service, no Go gateway. Built in Phase 9 (needs
+agent traffic to cache).
 
 - Build in the phase order from `codex_prompts.md`. **Do not build ahead.**
 - Deferred (do NOT build until its phase): parallel sub-tasks, full memory layer,

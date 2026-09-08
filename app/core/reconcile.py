@@ -3,11 +3,11 @@
 Runs at the START of every poll cycle, BEFORE claiming new tickets.
 Detects and fixes every form of drift between the local DB and real Jira status:
 
-  1. local claimed  + Jira == "To Do"            → clear claim; re-queue
-  2. local claimed  + Jira in {Done, Blocked}     → mark superseded (human override)
-  3. Jira In Progress + no local claim            → mark human_owned; do not claim
-  4. Jira "To Do"   + no local claim              → no-op (poller claims it next)
-  5. Jira status not in any configured name       → escalation cascade (comment +
+  1. local claimed  + Jira category == new        → clear claim; re-queue
+  2. local claimed  + Jira category == done       → mark superseded (human override)
+  3. Jira active category + no local claim        → mark human_owned; do not claim
+  4. Jira new category + no local claim           → no-op (poller claims it next)
+  5. Jira status category cannot be resolved      → escalation cascade (comment +
                                                     @mention + try blocked + needs_human)
   6. everything else                              → no-op
 
@@ -26,7 +26,6 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import update as sa_update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-from app.config import settings
 from app.db.connection import SessionLocal
 from app.db.models import Ticket
 from app.events import log_event as ev_log
@@ -40,7 +39,10 @@ logger = logging.getLogger(__name__)
 _last_sweep_at: datetime | None = None
 _FALLBACK_LOOKBACK_HOURS = 24
 
-_JIRA_TODO_STATUS = "To Do"
+_CATEGORY_NEW = "new"
+_CATEGORY_ACTIVE = "indeterminate"
+_CATEGORY_DONE = "done"
+_KNOWN_CATEGORIES = {_CATEGORY_NEW, _CATEGORY_ACTIVE, _CATEGORY_DONE}
 
 
 # ---------------------------------------------------------------------------
@@ -142,7 +144,7 @@ async def _reconcile_one(
             return None
 
     jira_status: str = detail["status"]
-    known = _known_statuses()
+    jira_category = detail.get("status_category") or jira.status_category(jira_status)
 
     # Fetch this ticket's local row (isolation: only its own row).
     with SessionLocal() as db:
@@ -150,37 +152,34 @@ async def _reconcile_one(
             db.query(Ticket).filter(Ticket.external_key == key).first()
         )
 
-    # ── Rule 1: claimed locally but Jira dragged back to "To Do" ────────────
-    if local and local.claimed_at and jira_status == _JIRA_TODO_STATUS:
+    # ── Rule 1: claimed locally but Jira dragged back to a ready status ─────
+    if local and local.claimed_at and jira_category == _CATEGORY_NEW:
         return await _clear_claim(key, local, detail)
 
-    # ── Rule 2: claimed locally but Jira moved to Done or Blocked ───────────
-    terminal = {
-        s.strip().lower()
-        for s in [settings.jira_status_done, settings.jira_status_blocked]
-        if s.strip()
-    }
-    if local and local.claimed_at and jira_status.lower() in terminal:
+    # ── Rule 2: claimed locally but Jira moved to a done status ─────────────
+    if local and local.claimed_at and jira_category == _CATEGORY_DONE:
         return await _mark_superseded(key, local, detail)
 
-    # ── Rule 3: Jira shows In Progress but we have no local claim ───────────
-    in_progress = settings.jira_status_in_progress.strip().lower()
-    if jira_status.lower() == in_progress and (
-        local is None or local.claimed_at is None
-    ):
+    # ── Rule 3: Jira shows active/working but we have no local claim ────────
+    if jira_category == _CATEGORY_ACTIVE and (local is None or local.claimed_at is None):
         return await _mark_human_owned(key, local, detail)
 
-    # ── Rule 4: "To Do" with no local claim — no-op, poller will claim ──────
-    if jira_status == _JIRA_TODO_STATUS and (local is None or local.claimed_at is None):
-        logger.debug("reconcile: %r is 'To Do' unclaimed — no-op", key)
+    # ── Rule 4: ready with no local claim — no-op, poller will claim ────────
+    if jira_category == _CATEGORY_NEW and (local is None or local.claimed_at is None):
+        logger.debug("reconcile: %r is ready-category unclaimed — no-op", key)
         return None
 
-    # ── Rule 5: status not in any configured name → escalate ────────────────
-    if jira_status.lower() not in known:
+    # ── Rule 5: status category cannot be resolved → escalate ──────────────
+    if jira_category not in _KNOWN_CATEGORIES:
         return await _escalate_unknown(jira, key, local, detail)
 
     # ── Rule 6: everything in sync — no-op ──────────────────────────────────
-    logger.debug("reconcile: %r status=%r — no drift", key, jira_status)
+    logger.debug(
+        "reconcile: %r status=%r category=%r — no drift",
+        key,
+        jira_status,
+        jira_category,
+    )
     return None
 
 
@@ -199,16 +198,17 @@ async def _clear_claim(
         db.execute(
             sa_update(Ticket)
             .where(Ticket.id == local.id)
-            .values(claimed_at=None, status="new")
+            .values(claimed_at=None, status="new", last_stuck_comment_at=None)
         )
         db.commit()
-    logger.info("reconcile: CLAIM_CLEARED %r (jira='To Do')", key)
+    logger.info("reconcile: CLAIM_CLEARED %r (jira_status=%r category=new)", key, detail["status"])
     return await ev_log(
         ticket_id=ticket_id,
         agent="reconcile",
         stage="claim_cleared",
         message=(
-            f"{key} claim cleared — Jira was dragged back to 'To Do'; "
+            f"{key} claim cleared — Jira was dragged back to ready status "
+            f"'{detail['status']}'; "
             "re-queued for pickup this cycle"
         ),
         key=key,
@@ -220,14 +220,14 @@ async def _mark_superseded(
     local: Ticket,
     detail: JiraIssueDetail,
 ) -> dict:
-    """Human moved ticket to Done/Blocked while we held it — mark superseded."""
+    """Human moved ticket to a done-category status while we held it."""
     ticket_id = str(local.id)
     jira_status = detail["status"]
     with SessionLocal() as db:
         db.execute(
             sa_update(Ticket)
             .where(Ticket.id == local.id)
-            .values(claimed_at=None, status="superseded")
+            .values(claimed_at=None, status="superseded", last_stuck_comment_at=None)
         )
         db.commit()
     logger.info("reconcile: SUPERSEDED %r jira_status=%r", key, jira_status)
@@ -236,7 +236,8 @@ async def _mark_superseded(
         agent="reconcile",
         stage="superseded",
         message=(
-            f"{key} superseded — Jira is '{jira_status}' (human override); "
+            f"{key} superseded — Jira is done-category status '{jira_status}' "
+            "(human override); "
             "local claim released"
         ),
         key=key,
@@ -249,7 +250,7 @@ async def _mark_human_owned(
     local: "Ticket | None",
     detail: JiraIssueDetail,
 ) -> dict:
-    """Jira shows In Progress but we never claimed it — a human is working it."""
+    """Jira shows active/working but we never claimed it — a human owns it."""
     assignee_display = detail.get("assignee_name") or "unknown"
 
     if local is not None:
@@ -258,7 +259,7 @@ async def _mark_human_owned(
             db.execute(
                 sa_update(Ticket)
                 .where(Ticket.id == local.id)
-                .values(status="human_owned")
+                .values(status="human_owned", last_stuck_comment_at=None)
             )
             db.commit()
     else:
@@ -289,7 +290,7 @@ async def _mark_human_owned(
         agent="reconcile",
         stage="human_owned",
         message=(
-            f"{key} is In Progress in Jira with no AI claim — "
+            f"{key} is active in Jira ({detail['status']}) with no AI claim — "
             f"owned by {assignee_display}; not claiming"
         ),
         key=key,
@@ -302,7 +303,7 @@ async def _escalate_unknown(
     local: "Ticket | None",
     detail: JiraIssueDetail,
 ) -> dict:
-    """Unknown/unmapped status — escalation cascade (R-11, R-25).
+    """Unknown/unresolved status category — escalation cascade (R-11, R-25).
 
     Must complete even if every optional step fails.  Minimum guarantee:
     a Jira comment reaches a human.
@@ -319,9 +320,9 @@ async def _escalate_unknown(
 
     # Step 1 (always): post Jira comment @mentioning the owner.
     comment_text = (
-        f"⚠️ Automated system notice: '{key}' is in an unmapped status "
-        f"'{jira_status}'. The AI agent cannot process tickets in this state. "
-        f"Please move this ticket to a known status (To Do / In Progress / Done)."
+        f"Automated system notice: '{key}' is in Jira status '{jira_status}', "
+        "but the app could not resolve that status to a Jira category "
+        "(new / indeterminate / done). Please check the workflow status config."
     )
     try:
         jira.comment_mentioning(key, account_id, display_name, comment_text)
@@ -371,26 +372,10 @@ async def _escalate_unknown(
         agent="reconcile",
         stage="escalated",
         message=(
-            f"{key} escalated — unmapped Jira status '{jira_status}'; "
+            f"{key} escalated — unresolved Jira status category for '{jira_status}'; "
             f"comment posted @{display_name}; flagged needs_human"
         ),
         key=key,
         jira_status=jira_status,
+        jira_category=detail.get("status_category"),
     )
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _known_statuses() -> set[str]:
-    """All configured Jira status names (lowercased) plus the hardcoded 'To Do'."""
-    configured = [
-        settings.jira_status_in_progress,
-        settings.jira_status_awaiting_approval,
-        settings.jira_status_in_review,
-        settings.jira_status_blocked,
-        settings.jira_status_done,
-        _JIRA_TODO_STATUS,
-    ]
-    return {s.strip().lower() for s in configured if s.strip()}

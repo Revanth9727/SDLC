@@ -191,6 +191,30 @@ sub-task's live state.
 
 ---
 
+## 8a. Solution reuse — memory as a gate, not just a hint
+
+Beyond injecting hints, memory can **short-circuit the expensive agents** when a past
+resolved ticket already solved essentially this problem. This is a **tiered reuse gate**
+at the front of the per-ticket flow (after repo resolution, before Diagnosis):
+
+1. Memory searches the top-K most similar **resolved** tickets.
+2. **Strong match** (similarity ≥ 0.9, the hardcoded bar): skip **Diagnosis and
+   Step-Planner** entirely. Take the past ticket's resolution as a **proposed fix**,
+   run a freshness/applicability check (does it still apply to the current code?), then
+   go straight to the **human gate** — "we've solved this before (from SCRUM-X), here's
+   the known fix, approve?" — then Executor applies, Critic verifies, PR. You save the
+   two expensive reasoning agents but KEEP the gate + verification.
+3. **Weak / no match**: fall through to the full pipeline as normal.
+
+**Why tiered, not aggressive.** A similar past ticket is NOT a proven-correct fix for
+this one: the match may be similar-not-identical, and the codebase may have changed. So
+reuse never blind-applies — it proposes, checks applicability, and still requires human
+approval + Critic verification. The savings come from skipping the heavy *reasoning*
+(Diagnosis, Step-Planner), not from skipping *safety* (gate, verification).
+
+This gate only helps once resolved tickets exist to match against, so it is built AFTER
+the full pipeline works (Phase 7.5), not at the same time as the base memory hints.
+
 ## 9. Build note (when this happens)
 
 The memory layer is built in its **own phase**, *after* the core loop (spine →
