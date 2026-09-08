@@ -1,0 +1,83 @@
+import uuid
+from datetime import datetime, timezone
+from typing import Any, Optional
+
+from sqlalchemy import DateTime, ForeignKey, JSON, String, Text
+from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class Ticket(Base):
+    """One incoming work request (from Jira or entered manually)."""
+
+    __tablename__ = "tickets"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    source: Mapped[str] = mapped_column(
+        String(16), nullable=False
+    )  # "manual" | "jira"
+    external_key: Mapped[Optional[str]] = mapped_column(
+        String(64), nullable=True
+    )  # e.g. "SANDBOX-42"; null for manual tickets
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    description: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="new"
+    )  # "new" | "processing" | "done" | "needs_human"
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+    subtasks: Mapped[list["Subtask"]] = relationship(
+        "Subtask", back_populates="ticket", cascade="all, delete-orphan"
+    )
+
+
+class Subtask(Base):
+    """One isolated unit of work extracted from a Ticket by the Planner.
+
+    The ``state`` column stores the full SubTaskState object as JSONB so that
+    LangGraph checkpointing can read and restore it without a separate table.
+    ``depends_on`` is a JSON list of subtask UUID strings (set by the Planner's
+    dependency graph). Isolation is enforced by always keying reads on ``id``
+    (R-4).
+    """
+
+    __tablename__ = "subtasks"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    ticket_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("tickets.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    type: Mapped[str] = mapped_column(
+        String(32), nullable=False
+    )  # "bug" | "feature" | "ci" | "design"
+    description: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="new"
+    )  # mirrors SubTaskState.status
+    depends_on: Mapped[Optional[list[Any]]] = mapped_column(
+        JSON, nullable=True, default=list
+    )  # list of subtask UUID strings
+    state: Mapped[Optional[dict[str, Any]]] = mapped_column(
+        JSONB, nullable=True
+    )  # full SubTaskState serialised to JSON
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+    ticket: Mapped["Ticket"] = relationship("Ticket", back_populates="subtasks")
