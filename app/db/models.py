@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from sqlalchemy import DateTime, ForeignKey, JSON, String, Text
-from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -30,6 +30,9 @@ class Ticket(Base):
     status: Mapped[str] = mapped_column(
         String(32), nullable=False, default="new"
     )  # "new" | "processing" | "done" | "needs_human"
+    repos: Mapped[Optional[list[str]]] = mapped_column(
+        ARRAY(Text), nullable=True, default=None
+    )  # confirmed GitHub repos e.g. ["owner/repo"] — set by the confirm-repos gate
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
