@@ -19,5 +19,18 @@ class Settings(BaseSettings):
     jira_api_token: str
     jira_project_key: str
 
+    # Optional Jira status name mapping (internal stage -> workflow status name).
+    # Leave a var unset or empty to skip that transition gracefully (R-11).
+    jira_status_in_progress: str = "In Progress"
+    jira_status_awaiting_approval: str = "Awaiting Approval"
+    jira_status_in_review: str = "In Review"
+    jira_status_blocked: str = "Blocked"
+    jira_status_done: str = "Done"
+
+    # Optional fallback names per stage when the primary name has no matching transition.
+    # Set as JSON in .env, e.g.:
+    #   JIRA_STATUS_FALLBACKS={"in_progress":"Start Progress","done":"Resolved"}
+    jira_status_fallbacks: dict[str, str] = {}
+
 
 settings = Settings()

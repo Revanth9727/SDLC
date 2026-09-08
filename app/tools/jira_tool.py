@@ -5,7 +5,7 @@ its input and output (R-7).
 """
 
 import logging
-from typing import TypedDict
+from typing import Any, TypedDict
 
 import httpx
 
@@ -22,7 +22,27 @@ class JiraIssue(TypedDict):
     description: str
     status: str  # Jira status name, e.g. "To Do", "In Progress"
 
-# TODO(1.4): add get_transitions(key) and set_status(key, internal_stage) here
+
+class JiraTransition(TypedDict):
+    id: str
+    name: str
+
+
+class SetStatusResult(TypedDict):
+    applied: bool
+    from_status: str        # status name before the attempt
+    to_status: str | None   # status name transitioned to, or None if skipped
+    reason: str | None      # populated only when applied=False
+
+
+# Maps internal stage names to the matching Settings attribute.
+_STAGE_MAP: dict[str, str] = {
+    "in_progress":        "jira_status_in_progress",
+    "awaiting_approval":  "jira_status_awaiting_approval",
+    "in_review":          "jira_status_in_review",
+    "blocked":            "jira_status_blocked",
+    "done":               "jira_status_done",
+}
 
 
 class JiraTool:
@@ -93,6 +113,98 @@ class JiraTool:
         result = JiraIssue(key=key, summary=summary, description=description, status=status)
         logger.info("jira.get_issue -> %r", result)
         return result
+
+    def get_transitions(self, key: str) -> list[JiraTransition]:
+        """Return the transitions allowed from the issue's CURRENT status.
+
+        Uses Jira's GET /rest/api/3/issue/{key}/transitions which only returns
+        transitions valid from the current state — never the full workflow.
+        """
+        logger.info("jira.get_transitions key=%r", key)
+        with self._client() as client:
+            resp = client.get(f"/rest/api/3/issue/{key}/transitions")
+            resp.raise_for_status()
+        transitions = [
+            JiraTransition(id=t["id"], name=t["to"]["name"])
+            for t in resp.json().get("transitions", [])
+        ]
+        logger.info("jira.get_transitions key=%r -> %r", key, transitions)
+        return transitions
+
+    def set_status(self, key: str, internal_stage: str) -> SetStatusResult:
+        """Transition a Jira issue to the status mapped from ``internal_stage``.
+
+        Never raises — if no matching transition is found, logs a warning and
+        returns applied=False (R-11).
+
+        Args:
+            key: Jira issue key, e.g. "AGT-1".
+            internal_stage: One of "in_progress", "awaiting_approval",
+                "in_review", "blocked", "done".
+        """
+        # 1. Resolve the desired status name from settings.
+        attr = _STAGE_MAP.get(internal_stage)
+        if not attr:
+            reason = f"unknown internal_stage {internal_stage!r}; must be one of {list(_STAGE_MAP)}"
+            logger.warning("jira.set_status SKIPPED key=%r stage=%r reason=%r", key, internal_stage, reason)
+            return SetStatusResult(applied=False, from_status="", to_status=None, reason=reason)
+
+        desired_name: str = getattr(settings, attr, "").strip()
+        if not desired_name:
+            reason = f"settings.{attr} is empty; transition for stage {internal_stage!r} skipped"
+            logger.warning("jira.set_status SKIPPED key=%r stage=%r reason=%r", key, internal_stage, reason)
+            return SetStatusResult(applied=False, from_status="", to_status=None, reason=reason)
+
+        # Snapshot current status before the transition attempt.
+        current_status = self.get_issue(key)["status"]
+
+        # 2. Fetch allowed transitions from the issue's CURRENT state.
+        transitions = self.get_transitions(key)
+        by_name: dict[str, str] = {t["name"].lower(): t["id"] for t in transitions}
+
+        # 3a. Match primary name (case-insensitive).
+        transition_id = by_name.get(desired_name.lower())
+
+        # 3b. Try configured fallback if primary not found.
+        if transition_id is None:
+            fallback_name = settings.jira_status_fallbacks.get(internal_stage, "").strip()
+            if fallback_name:
+                transition_id = by_name.get(fallback_name.lower())
+                if transition_id:
+                    desired_name = fallback_name
+
+        if transition_id is None:
+            available = [t["name"] for t in transitions]
+            reason = (
+                f"no matching transition for {desired_name!r} "
+                f"(fallback also missing); available={available}"
+            )
+            logger.warning(
+                "jira.set_status SKIPPED key=%r stage=%r reason=%r",
+                key, internal_stage, reason,
+            )
+            return SetStatusResult(
+                applied=False, from_status=current_status, to_status=None, reason=reason
+            )
+
+        # 4. POST the transition.
+        logger.info(
+            "jira.set_status APPLYING key=%r stage=%r transition_id=%r name=%r",
+            key, internal_stage, transition_id, desired_name,
+        )
+        with self._client() as client:
+            resp = client.post(
+                f"/rest/api/3/issue/{key}/transitions",
+                json={"transition": {"id": transition_id}},
+            )
+            resp.raise_for_status()
+        logger.info(
+            "jira.set_status APPLIED key=%r from=%r to=%r",
+            key, current_status, desired_name,
+        )
+        return SetStatusResult(
+            applied=True, from_status=current_status, to_status=desired_name, reason=None
+        )
 
     def comment(self, key: str, body: str) -> None:
         """Post a plain-text comment to the given Jira issue."""

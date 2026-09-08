@@ -10,6 +10,7 @@ from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel
 
 from app.db.connection import SessionLocal
 from app.db.models import Ticket
@@ -62,3 +63,15 @@ def debug_github() -> JSONResponse:
     """Temporary: return repo name and default branch from GitHub."""
     repo = GitHubTool().get_repo()
     return JSONResponse(content={"full_name": repo.full_name, "default_branch": repo.default_branch})
+
+
+class _StatusRequest(BaseModel):
+    key: str
+    stage: str
+
+
+@app.post("/debug/jira/status", response_class=JSONResponse)
+def debug_jira_status(body: _StatusRequest) -> JSONResponse:
+    """Temporary: move a Jira issue to the given internal stage and return the result."""
+    result = JiraTool().set_status(body.key, body.stage)
+    return JSONResponse(content=result)
