@@ -95,6 +95,16 @@ tbody td { padding: 10px 12px; }
 .badge--done        { background: #dcfce7; color: #15803d; }
 .badge--needs_human { background: #fee2e2; color: #991b1b; }
 
+.btn-small {
+  padding: 2px 8px;
+  font-size: 0.8rem;
+  cursor: pointer;
+  border: 1px solid #cbd5e1;
+  border-radius: 4px;
+  background: #f8fafc;
+}
+.btn-small:hover { background: #e2e8f0; }
+
 .event-claimed {
   padding: 0.4rem 0.75rem;
   margin: 0.25rem 0;

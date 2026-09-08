@@ -60,22 +60,41 @@ def _extract_repos(text: str) -> list[str]:
 
 
 def _step1_remote_links(key: str) -> list[str]:
-    """Extract repos from Jira remote links (web links) on the issue."""
+    """Extract repos from remote links AND issue links on the Jira issue.
+
+    Checks two sources:
+    - /rest/api/3/issue/{key}/remotelink  (web/URL links added via "Link > Web link")
+    - fields.issuelinks                   (Jira-to-Jira links; serialised to text and
+                                           scanned so any embedded GitHub URL is caught)
+    """
+    import json as _json
+
     try:
-        with _jira_client() as client:
-            resp = client.get(f"/rest/api/3/issue/{key}/remotelink")
-            if resp.status_code == 404:
-                return []
-            resp.raise_for_status()
         urls: list[str] = []
-        for link in resp.json():
-            obj = link.get("object", {})
-            for field in ("url", "title"):
-                val = obj.get(field, "")
-                if val:
-                    urls.append(val)
+
+        with _jira_client() as client:
+            # Remote (web) links
+            rl = client.get(f"/rest/api/3/issue/{key}/remotelink")
+            if rl.status_code == 200:
+                for link in rl.json():
+                    obj = link.get("object", {})
+                    for field in ("url", "title", "summary"):
+                        val = obj.get(field, "")
+                        if isinstance(val, str) and val:
+                            urls.append(val)
+                    gid = link.get("globalId", "")
+                    if gid:
+                        urls.append(gid)
+
+            # Issue links (Jira-to-Jira) — serialise entire payload and scan for URLs
+            il = client.get(f"/rest/api/3/issue/{key}", params={"fields": "issuelinks"})
+            if il.status_code == 200:
+                issuelinks = il.json().get("fields", {}).get("issuelinks") or []
+                if issuelinks:
+                    urls.append(_json.dumps(issuelinks))
+
         repos = _extract_repos(" ".join(urls))
-        logger.info("resolve.step1 key=%r remote_links -> %r", key, repos)
+        logger.info("resolve.step1 key=%r remote+issuelinks -> %r", key, repos)
         return repos
     except Exception as exc:
         logger.warning("resolve.step1 key=%r error=%s; skipping", key, exc)

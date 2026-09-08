@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from sqlalchemy import DateTime, ForeignKey, JSON, String, Text
+from sqlalchemy import DateTime, ForeignKey, Index, JSON, String, Text, text
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -44,6 +44,15 @@ class Ticket(Base):
 
     subtasks: Mapped[list["Subtask"]] = relationship(
         "Subtask", back_populates="ticket", cascade="all, delete-orphan"
+    )
+
+    __table_args__ = (
+        Index(
+            "ix_tickets_external_key_unique",
+            "external_key",
+            unique=True,
+            postgresql_where=text("external_key IS NOT NULL"),
+        ),
     )
 
 

@@ -19,6 +19,9 @@ import logging
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 
+from sqlalchemy import update as sa_update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+
 from app.config import settings
 from app.db.connection import SessionLocal
 from app.db.models import Ticket
@@ -89,36 +92,50 @@ async def _do_poll(emit: Callable[[dict], Awaitable[None]]) -> list[dict]:
 
 
 async def _claim_one(jira: JiraTool, issue: dict) -> dict | None:
-    """Claim one ticket atomically. Returns an event dict or None if skipped."""
+    """Claim one ticket atomically via two-step DB upsert.
+
+    Step A: UPDATE WHERE claimed_at IS NULL — claims an existing unclaimed row.
+    Step B: INSERT ON CONFLICT DO NOTHING — claims if the row doesn't exist yet.
+    If neither returns a row, another process beat us to it; we skip.
+    The partial unique index on external_key makes both steps safe across processes.
+    """
     key: str = issue["key"]
     now = datetime.now(timezone.utc)
 
     with SessionLocal() as db:
-        existing = db.query(Ticket).filter(Ticket.external_key == key).first()
+        # Step A: claim an existing unclaimed ticket.
+        upd = db.execute(
+            sa_update(Ticket)
+            .where(Ticket.external_key == key, Ticket.claimed_at.is_(None))
+            .values(claimed_at=now)
+            .returning(Ticket.id)
+        )
+        row = upd.first()
 
-        # 3a: already claimed — never re-claim
-        if existing is not None and existing.claimed_at is not None:
+        if row is None:
+            # Step B: insert if it doesn't exist yet (ON CONFLICT = already claimed).
+            ins = db.execute(
+                pg_insert(Ticket)
+                .values(
+                    source="jira",
+                    external_key=key,
+                    title=issue["summary"],
+                    description=issue["description"],
+                    status="new",
+                    claimed_at=now,
+                )
+                .on_conflict_do_nothing(index_elements=["external_key"])
+                .returning(Ticket.id)
+            )
+            row = ins.first()
+
+        db.commit()
+
+        if row is None:
             logger.info("poller: %r already claimed — skipping", key)
             return None
 
-        # 3b: atomic claim
-        if existing is None:
-            ticket = Ticket(
-                source="jira",
-                external_key=key,
-                title=issue["summary"],
-                description=issue["description"],
-                status="new",
-                claimed_at=now,
-            )
-            db.add(ticket)
-        else:
-            existing.claimed_at = now
-            ticket = existing
-
-        db.commit()
-        db.refresh(ticket)
-        ticket_id = str(ticket.id)
+        ticket_id = str(row.id)
 
     logger.info("poller: CLAIMED %r ticket_id=%s", key, ticket_id)
 

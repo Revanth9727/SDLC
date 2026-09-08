@@ -107,9 +107,10 @@ def debug_jira_status(body: _StatusRequest) -> JSONResponse:
 
 
 @app.post("/ticket/{key}/resolve-repos", response_class=JSONResponse)
-def ticket_resolve_repos(key: str) -> JSONResponse:
-    """Run the repo-resolver cascade for a Jira issue key and return candidates."""
+async def ticket_resolve_repos(key: str) -> JSONResponse:
+    """Run the repo-resolver cascade for a Jira issue key, return candidates, stream event."""
     result = resolve_repos(key)
+    await _broadcast({"type": "resolve_result", "key": key, **result})
     return JSONResponse(content=result)
 
 

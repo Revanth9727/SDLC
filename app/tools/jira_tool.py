@@ -28,11 +28,6 @@ class JiraTransition(TypedDict):
     name: str
 
 
-class SetStatusResult(TypedDict):
-    applied: bool
-    from_status: str        # status name before the attempt
-    to_status: str | None   # status name transitioned to, or None if skipped
-    reason: str | None      # populated only when applied=False
 
 
 # Maps internal stage names to the matching Settings attribute.
@@ -152,7 +147,7 @@ class JiraTool:
         logger.info("jira.get_transitions key=%r -> %r", key, transitions)
         return transitions
 
-    def set_status(self, key: str, internal_stage: str) -> SetStatusResult:
+    def set_status(self, key: str, internal_stage: str) -> dict[str, Any]:
         """Transition a Jira issue to the status mapped from ``internal_stage``.
 
         Never raises — if no matching transition is found, logs a warning and
@@ -168,13 +163,13 @@ class JiraTool:
         if not attr:
             reason = f"unknown internal_stage {internal_stage!r}; must be one of {list(_STAGE_MAP)}"
             logger.warning("jira.set_status SKIPPED key=%r stage=%r reason=%r", key, internal_stage, reason)
-            return SetStatusResult(applied=False, from_status="", to_status=None, reason=reason)
+            return {"applied": False, "from": "", "to": None, "reason": reason}
 
         desired_name: str = getattr(settings, attr, "").strip()
         if not desired_name:
             reason = f"settings.{attr} is empty; transition for stage {internal_stage!r} skipped"
             logger.warning("jira.set_status SKIPPED key=%r stage=%r reason=%r", key, internal_stage, reason)
-            return SetStatusResult(applied=False, from_status="", to_status=None, reason=reason)
+            return {"applied": False, "from": "", "to": None, "reason": reason}
 
         # Snapshot current status before the transition attempt.
         current_status = self.get_issue(key)["status"]
@@ -204,9 +199,7 @@ class JiraTool:
                 "jira.set_status SKIPPED key=%r stage=%r reason=%r",
                 key, internal_stage, reason,
             )
-            return SetStatusResult(
-                applied=False, from_status=current_status, to_status=None, reason=reason
-            )
+            return {"applied": False, "from": current_status, "to": None, "reason": reason}
 
         # 4. POST the transition.
         logger.info(
@@ -223,9 +216,7 @@ class JiraTool:
             "jira.set_status APPLIED key=%r from=%r to=%r",
             key, current_status, desired_name,
         )
-        return SetStatusResult(
-            applied=True, from_status=current_status, to_status=desired_name, reason=None
-        )
+        return {"applied": True, "from": current_status, "to": desired_name, "reason": None}
 
     def comment(self, key: str, body: str) -> None:
         """Post a plain-text comment to the given Jira issue."""

@@ -30,19 +30,29 @@
       <table>
         <thead>
           <tr>
-            <th>ID</th>
+            <th>Jira Key</th>
             <th>Title</th>
             <th>Status</th>
             <th>Claimed</th>
+            <th>Repos</th>
+            <th></th>
           </tr>
         </thead>
         <tbody>
           {% for ticket in tickets %}
           <tr>
-            <td class="mono">{{ ticket.id }}</td>
+            <td class="mono">{{ ticket.external_key or '—' }}</td>
             <td>{{ ticket.title }}</td>
             <td><span class="badge badge--{{ ticket.status }}">{{ ticket.status }}</span></td>
             <td>{% if ticket.claimed_at %}<span class="badge badge--processing">claimed</span>{% else %}—{% endif %}</td>
+            <td class="mono" style="font-size:0.8rem">
+              {% if ticket.repos %}{{ ticket.repos | join(', ') }}{% else %}—{% endif %}
+            </td>
+            <td>
+              {% if ticket.external_key and not ticket.repos %}
+              <button class="btn-small" onclick="startResolve('{{ ticket.external_key }}')">Resolve repos</button>
+              {% endif %}
+            </td>
           </tr>
           {% endfor %}
         </tbody>
@@ -50,6 +60,11 @@
       {% else %}
       <p class="empty">No tickets yet — submit one above.</p>
       {% endif %}
+    </section>
+
+    <section class="card" id="resolve-panel" style="display:none">
+      <h2>Repo resolution — <span id="resolve-key-label"></span></h2>
+      <div id="resolve-body"></div>
     </section>
 
     <section class="card">
@@ -63,6 +78,74 @@
   </main>
 
   <script>
+    // ── Repo resolution ──────────────────────────────────────────────────────
+    let _resolveKey = null;
+
+    function startResolve(key) {
+      _resolveKey = key;
+      document.getElementById('resolve-key-label').textContent = key;
+      const panel = document.getElementById('resolve-panel');
+      panel.style.display = '';
+      panel.scrollIntoView({behavior: 'smooth'});
+      document.getElementById('resolve-body').innerHTML = '<em>Resolving…</em>';
+      fetch(`/ticket/${key}/resolve-repos`, {method: 'POST'})
+        .then(r => r.json()).then(renderResolve)
+        .catch(() => { document.getElementById('resolve-body').innerHTML = '<span class="badge badge--needs_human">Error — see server logs</span>'; });
+    }
+
+    function renderResolve(data) {
+      const body = document.getElementById('resolve-body');
+      if (data.source === 'needs_paste') {
+        body.innerHTML = `
+          <p>No repos found automatically. Paste a GitHub repo URL:</p>
+          <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap">
+            <input id="paste-url" type="text" placeholder="https://github.com/owner/repo" style="width:22rem"/>
+            <button type="button" onclick="confirmPaste()">Confirm</button>
+          </div>
+          <p id="confirm-msg" style="margin-top:0.5rem"></p>`;
+      } else {
+        const checks = data.candidates.map(r =>
+          `<label style="display:block;margin:0.25rem 0"><input type="checkbox" name="repo" value="${r}" checked> <code>${r}</code></label>`
+        ).join('');
+        body.innerHTML = `
+          <p>Found via <strong>${data.source}</strong>:</p>
+          <div id="candidates">${checks}</div>
+          <button type="button" onclick="confirmSelected()" style="margin-top:0.75rem">Confirm repos</button>
+          <p id="confirm-msg" style="margin-top:0.5rem"></p>`;
+      }
+    }
+
+    async function confirmSelected() {
+      const checked = [...document.querySelectorAll('#candidates input[name=repo]:checked')].map(c => c.value);
+      if (!checked.length) { alert('Select at least one repo'); return; }
+      await doConfirm(checked);
+    }
+
+    async function confirmPaste() {
+      const url = document.getElementById('paste-url').value.trim();
+      const m = url.match(/github\.com\/([A-Za-z0-9_.\-]+\/[A-Za-z0-9_.\-]+)/);
+      if (!m) { alert('Not a valid GitHub repo URL (expected github.com/owner/repo)'); return; }
+      await doConfirm([m[1]]);
+    }
+
+    async function doConfirm(repos) {
+      const msg = document.getElementById('confirm-msg');
+      msg.textContent = 'Saving…';
+      const res = await fetch(`/ticket/${_resolveKey}/confirm-repos`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({repos})
+      });
+      const data = await res.json();
+      if (data.saved) {
+        msg.innerHTML = `<span class="badge badge--done">Saved: ${data.repos.join(', ')}</span>`;
+        setTimeout(() => location.reload(), 1000);
+      } else {
+        msg.innerHTML = `<span class="badge badge--needs_human">${data.error}</span>`;
+      }
+    }
+
+    // ── Run poll now ─────────────────────────────────────────────────────────
     // "Run poll now" button
     document.getElementById('poll-form').addEventListener('submit', async (e) => {
       e.preventDefault();
