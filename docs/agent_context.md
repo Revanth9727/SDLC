@@ -40,26 +40,54 @@ nothing is ever lost.
 
 ## NOT agents (deterministic code — no LLM)
 
-Jira I/O · GitHub ops · test runner · edit applier (SEARCH/REPLACE cascade) ·
-memory similarity search · the guard. (Only exception: memory may make ONE LLM call
-to summarise a resolution for storage.)
+Jira I/O (incl. **dynamic status sync**) · GitHub ops · test runner · edit applier
+(SEARCH/REPLACE cascade) · memory similarity search · the guard. (Only exception:
+memory may make ONE LLM call to summarise a resolution for storage.)
+
+## Jira status sync (R-25)
+
+Orchestrator sets ticket status at each stage boundary via a config-mapped, dynamic
+tool: `in_progress` (work starts) → `awaiting_approval` (human gate) → `in_review`
+(PR opened) → `blocked` (escalation) → `done`. Statuses are discovered at runtime and
+matched by name from config; a missing status is skipped with a warning, never blocks
+work. Never hardcode status names/IDs.
 
 ## The flow
 
 ```
-Jira → [intake] → PLANNER → sub-tasks → ORCHESTRATOR picks one
-  → per sub-task (ISOLATED state):
+Jira (poll every N min, claim only "To Do") → [RESOLVE REPOS: cascade + confirm gate]
+  → PLANNER → sub-tasks → ORCHESTRATOR picks one
+  → per sub-task (ISOLATED state, scoped to ONE repo):
        DIAGNOSIS → STEP-PLANNER → HUMAN GATE (pause) → EXECUTOR → CRITIC → [PR] → [memory write-back]
   → next sub-task → final report
 ```
 Every arrow = read/write the blackboard. Every world-action = a tool call. Every step
 = checkpointed.
 
+## Intake: polling + claiming (R-27)
+
+Poll Jira every `JIRA_POLL_INTERVAL_MINUTES` (default 30). Pick up ONLY tickets in
+"To Do"; leave every other status alone (may be in-flight or awaiting a human). Claim
+atomically: mark in local DB + flip to In Progress BEFORE any work, so no ticket is
+claimed twice even across overlapping polls. Multiple ready tickets run sequentially
+now; true parallelism (independent whole tickets, then independent sub-tasks) is
+Phase 10.
+
+## Repo resolution (R-26)
+
+A ticket's target repo is NOT hardcoded and a ticket may touch multiple repos. A
+deterministic resolver runs a cascade — web links → description → (best-effort)
+reporter repos → ask user to paste — and the result is ALWAYS confirmed by the user
+before work starts. The Planner assigns each sub-task its repo during decomposition
+(no separate repo agent). Each sub-task is isolated to ONE repo. `GITHUB_REPO` in
+`.env` is sandbox/testing only.
+
 ## The blackboard (one per sub-task = isolation boundary)
 
-`SubTaskState`: ticket_id, subtask_id, subtask_type, depends_on, diagnosis, plan,
-current_step, steps_done, approval_status, retry_count, budget_used, status,
-failure_reason, pr_url, memory_refs. Agents read/write named fields only.
+`SubTaskState`: ticket_id, subtask_id, subtask_type, **repo (owner/repo)**,
+depends_on, diagnosis, plan, current_step, steps_done, approval_status, retry_count,
+budget_used, status, failure_reason, pr_url, memory_refs. Agents read/write named
+fields only.
 
 ## The 10 rules that matter most (full set in ai_rules.md)
 

@@ -95,16 +95,19 @@ docker exec -it agentic_sdlc_db psql -U agentic -d agentic_sdlc -c "SELECT title
 ```
 Create two deterministic tools (no LLM) following ai_rules.md.
 - app/tools/jira_tool.py: JiraTool with
-  * list_open_issues() -> list of {key,summary,description}
-  * get_issue(key) -> {key,summary,description}
+  * list_open_issues() -> list of {key,summary,description,status}
+  * get_issue(key) -> {key,summary,description,status}
   * comment(key, body) -> None
   Uses httpx + basic auth (settings.jira_email, settings.jira_api_token) against
   settings.jira_base_url REST v3.
+  (Status transitions are added in 1.4 — leave a TODO hook, don't build yet.)
 - app/tools/github_tool.py: GitHubTool using PyGithub with
-  * get_repo() -> repo object for settings.github_repo ONLY (hard-guard: raise if
-    asked for any other repo)
-  * create_branch(base, new_branch)
-  * open_pr(branch, title, body) -> pr_url
+  * get_repo(full_name) -> repo object for a given "owner/repo" (the repo is
+    resolved per-ticket in 1.5, not hardcoded). Keep an allowlist hook for safety,
+    but do NOT hardcode a single repo. For local testing you may default to
+    settings.github_repo (the sandbox) when no repo is passed.
+  * create_branch(full_name, base, new_branch)
+  * open_pr(full_name, branch, title, body) -> pr_url
 - Add two temporary debug routes in main.py: GET "/debug/jira" returns the open
   Jira issues as JSON; GET "/debug/github" returns the repo name + default branch.
 End by telling me the two URLs to open and what I should see.
@@ -120,8 +123,165 @@ curl -s localhost:8000/debug/jira | python -m json.tool     # your AGT-1 ticket
 curl -s localhost:8000/debug/github | python -m json.tool   # your sandbox repo
 ```
 
-**Phase 1 done when:** you can submit a manual ticket via the UI and see it in
-the DB, and both Jira and GitHub respond with your real data from inside the app.
+## 1.4 Dynamic Jira status transitions (config-mapped, graceful)
+
+**PROMPT**
+```
+Extend app/tools/jira_tool.py with DYNAMIC, config-mapped status transitions
+(deterministic, no LLM), per ai_rules.md R-25 and architecture.md §5c.
+
+Add to settings (pydantic-settings, from .env) a status map:
+  JIRA_STATUS_IN_PROGRESS, JIRA_STATUS_AWAITING_APPROVAL, JIRA_STATUS_IN_REVIEW,
+  JIRA_STATUS_BLOCKED, JIRA_STATUS_DONE   (all optional, string names)
+plus an optional JIRA_STATUS_FALLBACKS map (internal_stage -> alternate name).
+
+Add methods:
+  * get_transitions(key) -> list of {id, name} from Jira's
+    GET /rest/api/3/issue/{key}/transitions  (the ALLOWED transitions from the
+    issue's CURRENT status — never assume the whole workflow).
+  * set_status(key, internal_stage) where internal_stage is one of:
+    "in_progress" | "awaiting_approval" | "in_review" | "blocked" | "done".
+    Logic:
+      1. resolve the desired status NAME from the config map for that stage
+      2. fetch get_transitions(key)
+      3. match desired name case-insensitively against available transition names;
+         if no match, try the configured fallback name; if still none, LOG a
+         warning and RETURN without error (never raise, never block work — R-11).
+      4. on match, POST the transition id.
+    Return {applied: bool, from: <old>, to: <new_or_none>, reason: <if skipped>}.
+
+Add a temporary debug route: POST "/debug/jira/status" body {key, stage} that
+calls set_status and returns the result dict, so I can watch transitions happen.
+Emit a structured log line for every attempt (applied or skipped).
+End by telling me how to move a real ticket's status from the app and see it on
+the Jira board.
+```
+
+**SEE** — you POST a stage, refresh your Jira board, and the ticket's status
+actually changed. A non-existent status logs a clear "skipped, no matching
+transition" instead of crashing.
+
+**TEST**
+```bash
+# with the server running and a real ticket key (e.g. AGT-1):
+curl -s -X POST localhost:8000/debug/jira/status \
+  -H 'content-type: application/json' \
+  -d '{"key":"AGT-1","stage":"in_progress"}' | python -m json.tool
+# Expected: {"applied": true, "from": "To Do", "to": "In Progress", ...}
+# Then check the Jira board — the ticket moved.
+
+# Now test graceful failure with a stage whose status you did NOT configure:
+curl -s -X POST localhost:8000/debug/jira/status \
+  -H 'content-type: application/json' \
+  -d '{"key":"AGT-1","stage":"blocked"}' | python -m json.tool
+# Expected (if "Blocked" not in your workflow): {"applied": false,
+#   "reason": "no matching transition for 'Blocked'"} — and NO crash.
+```
+
+**Note on wiring (used from Phase 3 onward):** the Orchestrator calls `set_status`
+at each stage boundary — `in_progress` when work starts, `awaiting_approval` at the
+human gate, `in_review` when the PR opens, `blocked` on guard escalation, `done` on
+completion. You build those call-sites as each stage is added; here you only build
+and prove the tool.
+
+## 1.5 Repo resolution from the ticket (cascade + confirm)
+
+**PROMPT**
+```
+Build the repo-resolver as a deterministic tool + a confirm gate, per
+architecture.md §5b and ai_rules.md R-26. No LLM in the resolver.
+
+app/tools/repo_resolver.py: resolve_repos(issue_key) -> ResolveResult with a
+CASCADE (stop at first that yields candidates):
+  1. web/remote links: GET the issue's remote links
+     (/rest/api/3/issue/{key}/remotelink) and any URLs in issue links; extract
+     github.com/owner/repo -> owner/repo (regex, dedupe).
+  2. description: scan the issue description text for github.com/owner/repo URLs.
+  3. reporter repos (BEST-EFFORT): if a GitHub username is derivable, list a few of
+     their repos as candidates; if messy/unavailable, SKIP to step 4 (do not block).
+  4. none found: return status="needs_paste" so the UI can ask for a URL.
+Return {source: links|description|reporter|needs_paste, candidates: [owner/repo...]}.
+
+Confirm gate: candidates are ALWAYS confirmed before proceeding (even a single
+match). Add UI + endpoints:
+  * POST "/ticket/{key}/resolve-repos" -> runs resolver, returns candidates (or
+    needs_paste), streams an event.
+  * POST "/ticket/{key}/confirm-repos" body {repos:[...]} -> stores the confirmed
+    repo list on the ticket record; this is the human-gate confirmation.
+Validate each owner/repo is reachable via GitHubTool.get_repo before accepting.
+Store confirmed repos on the ticket row (repos TEXT[]).
+End by telling me how to: link a repo on a Jira ticket, run resolve, see the
+candidate, confirm it, and see it saved.
+```
+
+**SEE** — you add a GitHub web link to a Jira ticket, click resolve in the UI, see
+the repo detected, confirm it, and see it saved on the ticket. Then test the
+no-link path and get asked to paste.
+
+**TEST**
+```bash
+# 1. On a Jira ticket, add a Web link to https://github.com/<you>/agentic-sdlc-sandbox
+# 2. Resolve:
+curl -s -X POST localhost:8000/ticket/AGT-1/resolve-repos | python -m json.tool
+#    Expected: {"source":"links","candidates":["<you>/agentic-sdlc-sandbox"]}
+# 3. Confirm:
+curl -s -X POST localhost:8000/ticket/AGT-1/confirm-repos \
+  -H 'content-type: application/json' \
+  -d '{"repos":["<you>/agentic-sdlc-sandbox"]}' | python -m json.tool
+#    Expected: {"saved": true, "repos": ["<you>/agentic-sdlc-sandbox"]}
+# 4. No-link ticket -> resolve returns {"source":"needs_paste","candidates":[]}
+```
+
+**Note (used in Phase 7+):** the Planner reads a ticket's confirmed `repos` and
+assigns each sub-task its repo during decomposition. There is NO separate
+repo-matching agent (R-26). You build that assignment when the Planner lands.
+
+## 1.6 Jira poller + atomic claiming (scheduled intake)
+
+**PROMPT**
+```
+Build the scheduled Jira poller as a deterministic background job (no LLM), per
+architecture.md §5a and ai_rules.md R-27.
+
+- app/core/poller.py: a scheduler (use asyncio task or APScheduler) running every
+  settings.jira_poll_interval_minutes (default 30).
+- Each cycle:
+  1. Guard: if the previous cycle is still running, skip this tick (no overlap).
+  2. Query Jira for issues in status "To Do" (the ready signal) in the project.
+  3. For each, CLAIM atomically BEFORE any work:
+       a. skip if already in the local claims table (tickets.claimed_at set)
+       b. insert/mark the ticket row claimed with claimed_at = now
+       c. flip Jira status to in_progress via JiraTool.set_status (R-25)
+  4. Process claimed tickets SEQUENTIALLY for now (parallelism is Phase 10) — for
+     this phase, "process" just means: create the ticket record and emit an event
+     "claimed" (real agent flow arrives in later phases).
+- Add a manual trigger endpoint POST "/poll/run-once" so I can force a cycle
+  without waiting 30 min, and a UI button "Run poll now".
+- Emit a structured event per claimed ticket so it shows in the UI.
+Never re-claim an in-flight ticket; never touch non-"To Do" tickets.
+End by telling me how to create a To Do ticket, trigger a poll, and watch it get
+claimed (UI + Jira board flipping to In Progress).
+```
+
+**SEE** — create a Jira ticket (status To Do), click "Run poll now" (or wait for
+the interval), and watch it appear as *claimed* in the UI while the ticket flips to
+**In Progress** on your Jira board. Trigger a second poll — it is NOT re-claimed.
+
+**TEST**
+- Create 2 tickets in **To Do** and 1 in **In Review**.
+- Click "Run poll now."
+- Expected: both To Do tickets get claimed (appear in UI, move to In Progress on the
+  board); the In Review ticket is **untouched**.
+- Click "Run poll now" again → already-claimed tickets are NOT picked up again.
+
+**Note (Phase 10):** claimed tickets are processed one at a time here. True parallel
+processing of independent tickets is enabled in Phase 10.
+
+**Phase 1 done when:** you can submit a manual ticket and see it in the DB; Jira and
+GitHub respond with real data in-app; you can move a Jira status from the app
+(missing statuses skipped gracefully); you can resolve + confirm a repo linked on a
+ticket (paste fallback when none); and the poller claims **To Do** tickets on a
+trigger — flipping them to In Progress, skipping non-To-Do and already-claimed ones.
 
 ---
 
@@ -211,7 +371,8 @@ Create the LLM access layer and the core state model.
   with the error fed back). Model defaults from settings; NO agent calls OpenAI
   directly (ai_rules R-11 (fail safe & visible)). Track token usage and return it.
 - app/agents/state.py: the SubtaskState Pydantic model exactly as in
-  architecture.md §7 (isolation & memory).1 (all fields, including control fields).
+  architecture.md §5 (the blackboard) — all fields, including `repo` and the
+  control fields (retry_count, budget_used, status, failure_reason).
 End by telling me how to run a quick script that calls complete_json and prints a
 validated object.
 ```
@@ -236,9 +397,12 @@ EOF
 **PROMPT**
 ```
 Extend app/tools/github_tool.py (or a new repo_tool.py) with read capability:
-- clone_or_pull() -> local path to a fresh checkout of the sandbox repo's default
-  branch (shallow clone to a temp dir; reuse if present).
-- list_files() and read_file(path) within that checkout.
+- clone_or_pull(full_name) -> local path to a fresh checkout of the given
+  "owner/repo" default branch (shallow clone to a temp dir keyed by repo; reuse if
+  present). The repo comes from the sub-task's `repo` field (assigned by the
+  Planner), NOT a hardcoded one — for this early phase you may pass the sandbox repo
+  explicitly while the Planner isn't built yet.
+- list_files(full_name) and read_file(full_name, path) within that checkout.
 These are deterministic tools. End by telling me how to print the repo's file list
 and app.py contents.
 ```
@@ -249,9 +413,10 @@ and app.py contents.
 ```bash
 python - <<'EOF'
 from app.tools.repo_tool import RepoTool
-r = RepoTool(); r.clone_or_pull()
-print(r.list_files())
-print(r.read_file("app.py"))
+r = RepoTool(); repo = "YOUR_USER/agentic-sdlc-sandbox"
+r.clone_or_pull(repo)
+print(r.list_files(repo))
+print(r.read_file(repo, "app.py"))
 EOF
 # Expected: file list incl app.py, and the buggy divide() source
 ```
@@ -317,9 +482,10 @@ the Step-Planner.
 **PROMPT**
 ```
 Add a human approval gate after Step-Planner using LangGraph's interrupt().
-- When reached, set approval_status="pending", post the plan+reasoning as a Jira
-  comment (JiraTool.comment) AND emit a "needs approval" event, then interrupt so
-  the graph pauses with state checkpointed.
+- When reached, set approval_status="pending", set Jira status to
+  `awaiting_approval` via JiraTool.set_status (R-25), post the plan+reasoning as a
+  Jira comment (JiraTool.comment) AND emit a "needs approval" event, then interrupt
+  so the graph pauses with state checkpointed.
 - The UI ticket page shows the pending plan with Approve / Reject buttons.
 Follow ai_rules (checkpointed, resumable). End by telling me how to see the flow
 pause and wait.
@@ -336,10 +502,11 @@ issue, and the graph state is checkpointed (still there after a server restart).
 **PROMPT**
 ```
 Add POST "/tickets/{id}/subtasks/{sid}/approve" and ".../reject" that set
-approval_status and resume the LangGraph run from the checkpoint. On reject:
-status -> needs_human with the note. On approve: continue (for now, the next node
-is a placeholder that just logs "would execute"). End by telling me how to
-approve and watch it resume.
+approval_status and resume the LangGraph run from the checkpoint. On approve: set
+Jira status back to `in_progress` (work resuming) and continue (for now, the next
+node is a placeholder that just logs "would execute"). On reject: status ->
+needs_human with the note, and set Jira status to `blocked` (R-25). End by telling
+me how to approve and watch it resume.
 ```
 
 **SEE** — click Approve, watch the flow resume live past the gate.
@@ -409,10 +576,13 @@ now has a zero-check and tests run. Inspect `state->'steps_done'`.
 
 **PROMPT**
 ```
-Add the PR node: after Executor succeeds, GitHubTool creates a branch, commits
-the changed files, pushes, opens a PR, writes pr_url into state, comments the PR
-link on the Jira issue, and sets ticket status done. Idempotent: don't open a
-duplicate PR on retry (ai_rules R-19 (never touch main; PR only)). End by telling me how to see the real PR.
+Add the PR node: after Executor succeeds, GitHubTool creates a branch on the
+sub-task's `repo`, commits the changed files, pushes, opens a PR, writes pr_url
+into state, comments the PR link on the Jira issue, and sets Jira status to
+`in_review` via set_status (the PR is open awaiting human merge — NOT done yet;
+`done` is only after merge, a later phase). Idempotent: don't open a duplicate PR
+on retry (ai_rules R-19 (never touch main; PR only)). End by telling me how to see
+the real PR.
 ```
 
 **SEE** — a **real pull request** on your sandbox GitHub repo, linked back in the
@@ -469,9 +639,16 @@ for human when the budget is exceeded.
 ```
 Build the human-escalation experience: a page listing all subtasks with
 status=needs_human, each showing failure_reason and the state so far, with a
-"retry" and a "reject" action. Escalation is a first-class outcome (ai_rules R-8 (loop limits + human exit)).
+"retry" and a "reject" action. When a subtask escalates to needs_human, ALSO set
+its Jira status to `blocked` via set_status (R-25) so the board reflects it.
+Escalation is a first-class outcome (ai_rules R-8 (loop limits + human exit)).
 End by telling me how to see and act on an escalated subtask.
 ```
+
+> **Status lifecycle now complete across the flow** (all via set_status, R-25):
+> claim → `in_progress` (1.6) · gate → `awaiting_approval` (4.2) · approve →
+> `in_progress` (4.3) · PR open → `in_review` (5.3) · escalation → `blocked` (6.3) ·
+> (merge → `done` is a later phase). Reject at the gate → `blocked` (4.3).
 
 **SEE** — a queue of escalated items you can review and act on.
 
@@ -510,18 +687,26 @@ rejects → loop → eventually escalates). Watch both live.
 
 **PROMPT**
 ```
-Add app/agents/planner.py: PlannerAgent. Input: a ticket. Output: validated
-list[SubtaskSpec] {type, description, depends_on}. For now the flow still handles
-ONE sub-task (take the first), but the Planner runs and records the full
-decomposition. Failure exit: CannotDecompose -> needs_human. Put Planner at the
-very front of the graph. End by telling me how to see a ticket decomposed.
+Add app/agents/planner.py: PlannerAgent. Input: a ticket PLUS its confirmed
+repo list (ticket.repos from 1.5). Output: validated list[SubtaskSpec]
+{type, description, repo, depends_on}. The Planner ASSIGNS each sub-task exactly
+one repo from the confirmed list (R-26) — this is the Planner's job, NOT a separate
+agent. If a sub-task's repo is ambiguous (multiple repos, unclear which), the
+Planner flags it -> needs_human at the gate rather than guessing (R-10). If the
+ticket has exactly one confirmed repo, every sub-task gets that repo.
+For now the flow still handles ONE sub-task (take the first), but the Planner runs
+and records the full decomposition. Failure exit: CannotDecompose -> needs_human.
+Put Planner at the very front of the graph (after repo resolution). Each sub-task's
+`repo` flows into its SubtaskState and is used by Diagnosis/Executor/PR.
+End by telling me how to see a ticket decomposed with a repo assigned per sub-task.
 ```
 
-**SEE** — a ticket now first shows a decomposition into sub-task(s) before the
-per-sub-task flow runs.
+**SEE** — a ticket now first shows a decomposition into sub-task(s), each with its
+assigned repo, before the per-sub-task flow runs.
 
-**TEST** — submit a single-issue ticket; confirm one sub-task is produced and the
-full Planner→Diagnosis→StepPlanner→gate→Executor→Critic→PR flow runs.
+**TEST** — submit a single-issue ticket with one confirmed repo; confirm one
+sub-task is produced with that repo assigned, and the full
+Planner→Diagnosis→StepPlanner→gate→Executor→Critic→PR flow runs against it.
 
 ## 7.3 End-to-end full-flow verification
 

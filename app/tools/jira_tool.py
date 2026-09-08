@@ -25,7 +25,8 @@ class JiraIssue(TypedDict):
 
 class JiraTransition(TypedDict):
     id: str
-    name: str
+    name: str  # destination status name, e.g. "In Progress"
+    transition_name: str  # Jira workflow transition label, e.g. "Start progress"
 
 
 
@@ -78,7 +79,7 @@ class JiraTool:
         logger.info("jira.list_open_issues jql=%r", jql)
         with self._client() as client:
             resp = client.get(
-                "/rest/api/3/search",
+                "/rest/api/3/search/jql",
                 params={"jql": jql, "fields": "summary,description,status", "maxResults": 50},
             )
             resp.raise_for_status()
@@ -115,7 +116,7 @@ class JiraTool:
         logger.info("jira.list_by_status jql=%r", jql)
         with self._client() as client:
             resp = client.get(
-                "/rest/api/3/search",
+                "/rest/api/3/search/jql",
                 params={"jql": jql, "fields": "summary,description,status", "maxResults": 50},
             )
             resp.raise_for_status()
@@ -141,7 +142,11 @@ class JiraTool:
             resp = client.get(f"/rest/api/3/issue/{key}/transitions")
             resp.raise_for_status()
         transitions = [
-            JiraTransition(id=t["id"], name=t["to"]["name"])
+            JiraTransition(
+                id=t["id"],
+                name=t["to"]["name"],
+                transition_name=t.get("name", ""),
+            )
             for t in resp.json().get("transitions", [])
         ]
         logger.info("jira.get_transitions key=%r -> %r", key, transitions)
@@ -177,6 +182,14 @@ class JiraTool:
         # 2. Fetch allowed transitions from the issue's CURRENT state.
         transitions = self.get_transitions(key)
         by_name: dict[str, str] = {t["name"].lower(): t["id"] for t in transitions}
+        logger.info(
+            "jira.set_status MATCH_CHECK key=%r stage=%r desired=%r current=%r transitions=%r",
+            key,
+            internal_stage,
+            desired_name,
+            current_status,
+            transitions,
+        )
 
         # 3a. Match primary name (case-insensitive).
         transition_id = by_name.get(desired_name.lower())
@@ -188,6 +201,15 @@ class JiraTool:
                 transition_id = by_name.get(fallback_name.lower())
                 if transition_id:
                     desired_name = fallback_name
+
+        logger.info(
+            "jira.set_status MATCH_RESULT key=%r stage=%r desired=%r matched=%s transition_id=%r",
+            key,
+            internal_stage,
+            desired_name,
+            bool(transition_id),
+            transition_id,
+        )
 
         if transition_id is None:
             available = [t["name"] for t in transitions]

@@ -124,7 +124,10 @@ async def _claim_one(jira: JiraTool, issue: dict) -> dict | None:
                     status="new",
                     claimed_at=now,
                 )
-                .on_conflict_do_nothing(index_elements=["external_key"])
+                .on_conflict_do_nothing(
+                    index_elements=["external_key"],
+                    index_where=Ticket.external_key.is_not(None),
+                )
                 .returning(Ticket.id)
             )
             row = ins.first()

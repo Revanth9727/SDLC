@@ -94,10 +94,17 @@ surface for zero benefit.
 Jira ticket
    │
    ▼
-[Jira intake]  (deterministic)
+Jira ticket (status "To Do")
+   │
+   ▼
+[Jira POLLER]  (every N min; claims only "To Do" tickets, flips to In Progress)
+   │
+   ▼
+[RESOLVE REPOS]  (deterministic cascade + confirm gate — §5b)
    │
    ▼
 PLANNER ──► splits into isolated sub-tasks + dependency graph
+            (assigns each sub-task its repo from the confirmed list)
    │
    ▼
 ORCHESTRATOR ──► picks next ready sub-task (parallel where independent)
@@ -147,6 +154,7 @@ SubTaskState:
   ticket_id            # parent ticket
   subtask_id           # THIS sub-task (isolation key)
   subtask_type         # bug | feature | ci | design
+  repo                 # owner/repo this sub-task works on (assigned by Planner)
   depends_on           # sub-task ids that must finish first
 
   # produced by agents (structured, validated)
@@ -180,9 +188,111 @@ Two rules about this object:
   later; it is not the default.
 
 The Planner also has a small **TicketState** (the only thing that sees all sub-tasks):
-`{ticket_id, raw_ticket, subtasks[], dependency_graph, overall_status}`.
+`{ticket_id, raw_ticket, resolved_repos[], subtasks[], dependency_graph, overall_status}`.
+`resolved_repos` is the confirmed list from §5b, which the Planner assigns across
+sub-tasks.
 
 ---
+
+## 5a. Ticket intake: polling + status-based claiming
+
+Tickets enter by **polling Jira on a schedule** (interval configurable via
+`JIRA_POLL_INTERVAL_MINUTES`, default 30). The poller is a deterministic job (no LLM).
+
+**Status is the work-queue.** Only tickets in the ready status (**"To Do"**, the
+project's default/created state) are eligible. Tickets in any other status
+(In Progress, In Review, Awaiting Approval, Blocked, Done) are **left alone** — they're
+already being worked, waiting on a human, or finished. This is deliberate: an
+In-Progress/In-Review ticket may have an active run or a pending human decision;
+re-grabbing it would double-process it.
+
+**Atomic claiming (prevents double pickup).** The instant a ticket is selected:
+1. Record it as claimed in the local DB (`tickets` row + claimed_at timestamp), and
+2. Flip its Jira status to `in_progress` (R-25) — *before any work begins*.
+The status flip **is** the claim: the next poll skips it (not "To Do" anymore), and the
+local claim record guards the brief gap between selecting and flipping. Every poll
+checks BOTH the local claim table and Jira status, so a ticket is never claimed twice —
+even if polls overlap.
+
+**Overlap & recovery.**
+- A poll never re-claims an already-claimed ticket (local table is authoritative for
+  in-flight work). A simple "poll already running?" guard avoids piling up cycles.
+- A ticket that is In Progress in Jira but has **no active run** in the local DB is
+  *orphaned* (e.g. a crash mid-work); it is flagged for a human, never silently left
+  stuck (R-11). (Recovery job is a later phase.)
+
+**Concurrency.** When a poll finds multiple ready tickets, they are **processed
+sequentially for now**; independent tickets are safe to run in parallel (isolated
+state), so **true parallelism is enabled in Phase 10**. This is the first place
+parallelism applies: whole independent tickets. (The second is independent sub-tasks
+within a ticket — also Phase 10.)
+
+## 5b. Repo resolution (which codebase does this ticket touch?)
+
+A ticket does not carry its target repo in a fixed field, and a single ticket may
+touch **multiple repos**. So before the Planner can decompose, the system must resolve
+**which repo(s)** the ticket is about. This is a deterministic **repo-resolver**
+(not an agent) followed by a **human confirmation gate**. It runs right after intake,
+before planning:
+
+```
+Jira intake → RESOLVE REPOS (cascade + confirm gate) → PLANNER → …
+```
+
+**The resolution cascade** (stop when candidates are found, then always confirm):
+
+1. **Web links** — read the ticket's remote/web links; extract any
+   `github.com/owner/repo` URLs. (Primary, reliable path — the user links the repo via
+   Issue → Link → Web link.)
+2. **Description** — scan the ticket description for GitHub URLs.
+3. **Reporter's GitHub repos (best-effort)** — if the reporter's GitHub account is
+   known, list their repos as candidates. This path is noisy/often unavailable (no
+   native Jira↔GitHub user mapping, too many repos, org-owned repos); if it can't
+   produce a short clean candidate list, **skip to step 4**. Never a rabbit hole.
+4. **Ask the user to paste** — if nothing else worked, open a gate asking for the
+   repo URL(s) directly. This fallback covers every remaining case.
+
+**Always confirm.** Even a single unambiguous match is shown to the user for
+confirmation before any work starts — a wrong repo means diagnosing/editing the wrong
+codebase, so a one-tap confirm is cheap insurance. Confirmation and paste both use the
+existing human-gate (pause/resume) mechanism — no new machinery.
+
+**Output:** a confirmed list of `owner/repo`. The Planner receives this list and,
+during decomposition, **assigns each sub-task its repo** (see §2 principle 1 and the
+per-sub-task `repo` field in §5). Repo assignment is part of the Planner's existing
+reasoning — there is no separate repo-matching agent. If a sub-task's repo is
+ambiguous, the Planner flags it at the gate rather than guessing (R-10).
+
+## 5c. Jira status sync (keeping the board honest)
+
+The Jira ticket is what humans watch, so the system keeps its **status** in sync with
+where the work actually is — a production requirement, not a nicety. This is a
+deterministic responsibility of the Jira component (not an agent), triggered by the
+Orchestrator at stage boundaries.
+
+**Stage → status mapping** (internal stage → configured Jira status name):
+
+| System event | Internal stage | Typical status |
+|---|---|---|
+| Work starts on the ticket/sub-task | `in_progress` | In Progress |
+| Plan posted, waiting on the human gate | `awaiting_approval` | Awaiting Approval |
+| PR opened | `in_review` | In Review |
+| Guard escalation / cannot proceed | `blocked` | Blocked |
+| Completed | `done` | Done |
+
+**Dynamic, not hardcoded (the key design choice).** Jira workflows are project-specific
+and only allow *configured* transitions from the current status. So the system:
+
+1. **Discovers** allowed transitions at runtime from the ticket's current status (Jira's
+   transitions endpoint) — never assumes the full workflow.
+2. **Maps** internal stages to status *names* via config (env), with optional fallbacks,
+   matched case-insensitively.
+3. **Degrades gracefully** — if a mapped status doesn't exist in the project's workflow,
+   it logs a warning and continues. A status update NEVER blocks or fails the real work
+   (see `ai_rules.md` R-25, which is R-11 applied to status).
+
+This means the same code works across standard and custom Jira workflows with only
+config changes, and a mis-mapped status is a harmless warning, not an outage.
 
 ## 6. The guard (how failure-exit and contracts are enforced)
 

@@ -176,6 +176,9 @@ OPENAI_MODEL=gpt-4o                 # swappable; see agent_context.md
 # --- GitHub ---
 GITHUB_TOKEN=github_pat_REPLACE_ME
 GITHUB_OWNER=your-github-username
+# GITHUB_REPO is the SANDBOX repo for local testing only. In real runs the target
+# repo(s) are resolved from the ticket (web links/description) and confirmed by you —
+# never hardcoded. See architecture.md §5b and ai_rules.md R-26.
 GITHUB_REPO=agentic-sdlc-sandbox
 
 # --- Jira ---
@@ -183,6 +186,20 @@ JIRA_BASE_URL=https://your-site.atlassian.net
 JIRA_EMAIL=you@example.com
 JIRA_API_TOKEN=REPLACE_ME
 JIRA_PROJECT_KEY=SANDBOX
+
+# --- Jira status mapping (dynamic; match YOUR project's workflow names) ---
+# Internal stage -> the Jira status NAME to transition to. Leave blank to skip a stage.
+# The system discovers allowed transitions at runtime and matches these names
+# case-insensitively; a name not in your workflow is skipped with a warning (never crashes).
+JIRA_STATUS_IN_PROGRESS=In Progress
+JIRA_STATUS_AWAITING_APPROVAL=Awaiting Approval
+JIRA_STATUS_IN_REVIEW=In Review
+JIRA_STATUS_BLOCKED=Blocked
+JIRA_STATUS_DONE=Done
+
+# --- Jira polling (scheduled intake) ---
+# How often to poll Jira for new "To Do" tickets to pick up. Default 30.
+JIRA_POLL_INTERVAL_MINUTES=30
 EOF
 
 git add .env.example docker-compose.yml .gitignore

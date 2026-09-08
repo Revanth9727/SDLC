@@ -136,6 +136,38 @@ Because diagnosis happens before human approval (possibly much earlier), verify 
 target files haven't changed since diagnosis before the Executor edits. If the repo
 moved, re-diagnose or flag — don't edit a stale codebase.
 
+**R-25. Jira status is dynamic, config-mapped, and non-blocking.**
+Never hardcode Jira status names or transition IDs. Discover allowed transitions at
+runtime (Jira's transitions endpoint) from the ticket's *current* status; map internal
+stages (`in_progress`, `awaiting_approval`, `in_review`, `blocked`, `done`) to status
+names via config, with optional fallbacks. Match case-insensitively. If no matching
+transition exists in the project's workflow, log a warning and continue — a status
+update must NEVER raise, block, or fail the actual work (this is R-11 applied to
+status). The Orchestrator triggers `set_status` at each stage boundary; it is a
+deterministic tool call, never an agent decision.
+
+**R-26. The target repo comes from the ticket, resolved then confirmed — never hardcoded.**
+There is no single global repo. Before planning, a deterministic repo-resolver runs a
+cascade — ticket web links → description → (best-effort) reporter's repos → ask the
+user to paste — and the resolved repo(s) are ALWAYS confirmed by the user at a gate
+before work starts (a wrong repo edits the wrong codebase). Reading links/description
+is plain code (no LLM). Assigning a repo to each sub-task is the Planner's job during
+decomposition — NOT a separate agent. Each sub-task carries exactly one `repo` and is
+isolated to it. The sandbox `GITHUB_REPO` env var is for local testing only, never the
+production source of truth.
+
+**R-27. Intake is poll-based with atomic, status-based claiming.**
+Tickets are pulled by polling Jira on a configurable interval
+(`JIRA_POLL_INTERVAL_MINUTES`, default 30) — a deterministic job, no LLM. Only tickets
+in the ready status ("To Do") are eligible; tickets in any other status are left
+untouched. On selection, a ticket is claimed atomically: recorded in the local DB
+(with timestamp) AND flipped to In Progress, before any work. Every poll checks both
+the local claim table and Jira status, so no ticket is ever claimed twice, even if
+polls overlap. A poll must not re-enter while the previous cycle runs. A ticket
+In Progress in Jira with no active local run is orphaned and flagged for a human, never
+silently stuck (R-11). Multiple ready tickets are processed sequentially until true
+parallelism is enabled (Phase 10).
+
 ---
 
 ## G. Code quality (keep it reviewable)
