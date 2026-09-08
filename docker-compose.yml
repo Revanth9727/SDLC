@@ -1,0 +1,20 @@
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    container_name: agentic_sdlc_db
+    environment:
+      POSTGRES_USER: agentic
+      POSTGRES_PASSWORD: localdevpassword
+      POSTGRES_DB: agentic_sdlc
+    ports:
+      - "5432:5432"
+    volumes:
+      - agentic_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agentic -d agentic_sdlc"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  agentic_pgdata:
