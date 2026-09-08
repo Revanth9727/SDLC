@@ -20,7 +20,7 @@ from sse_starlette.sse import EventSourceResponse
 from app import events as ev
 from app.core.poller import poll_cycle, start_loop
 from app.db.connection import SessionLocal
-from app.db.models import Ticket
+from app.db.models import Ticket, TicketEvent
 from app.tools.github_tool import GitHubTool
 from app.tools.jira_tool import JiraTool
 from app.tools.repo_resolver import resolve_repos
@@ -183,15 +183,37 @@ class _DebugEventBody(BaseModel):
 
 @app.post("/debug/events/{ticket_id}", response_class=JSONResponse)
 async def debug_publish_event(ticket_id: str, body: _DebugEventBody) -> JSONResponse:
-    """Publish a test event to a ticket stream — useful for manual SSE verification."""
-    event = ev.make_event(
+    """Persist + publish a test event — verifies both durability and live stream."""
+    event = await ev.log_event(
+        ticket_id=ticket_id,
         agent=body.agent,
         stage=body.stage,
         message=body.message,
-        ticket_id=ticket_id,
     )
-    await ev.publish(ticket_id, event)
     return JSONResponse(content={"published": event, "subscribers": ev.subscriber_count(ticket_id)})
+
+
+@app.get("/tickets/{ticket_id}/events", response_class=JSONResponse)
+def ticket_event_history(ticket_id: str) -> JSONResponse:
+    """Return all persisted events for a ticket ordered by time (for page-load replay)."""
+    with SessionLocal() as db:
+        rows = (
+            db.query(TicketEvent)
+            .filter(TicketEvent.ticket_id == ticket_id)
+            .order_by(TicketEvent.ts.asc())
+            .all()
+        )
+    return JSONResponse(content=[
+        {
+            "agent":      r.agent,
+            "stage":      r.stage,
+            "message":    r.message,
+            "ts":         r.ts.isoformat(),
+            "ticket_id":  str(r.ticket_id),
+            "subtask_id": str(r.subtask_id) if r.subtask_id else None,
+        }
+        for r in rows
+    ])
 
 
 @app.post("/ticket/{key}/confirm-repos", response_class=JSONResponse)

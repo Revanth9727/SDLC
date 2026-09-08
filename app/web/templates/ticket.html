@@ -53,13 +53,11 @@
 
     function fmtTime(isoStr) {
       try {
-        const d = new Date(isoStr);
-        return d.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit', second: '2-digit'});
+        return new Date(isoStr).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit', second:'2-digit'});
       } catch { return isoStr || ''; }
     }
 
-    function appendEvent(ev) {
-      if (emptyEl) { emptyEl.remove(); emptyEl = null; }
+    function makeRow(ev) {
       const agent = (ev.agent || 'system').toLowerCase();
       const row = document.createElement('div');
       row.className = `ev-row ev--${agent}`;
@@ -68,23 +66,50 @@
         `<span class="ev-stage">${ev.stage || '—'}</span>` +
         `<span class="ev-msg">${ev.message || ''}</span>` +
         `<span class="ev-ts">${fmtTime(ev.ts)}</span>`;
-      feed.appendChild(row);
-      // Keep newest visible
+      return row;
+    }
+
+    function appendEvent(ev) {
+      if (emptyEl) { emptyEl.remove(); emptyEl = null; }
+      feed.appendChild(makeRow(ev));
       feed.scrollTop = feed.scrollHeight;
     }
 
+    function insertDivider(label) {
+      const d = document.createElement('div');
+      d.style.cssText = 'text-align:center;color:#94a3b8;font-size:0.72rem;padding:4px 0;font-family:system-ui;letter-spacing:.05em;';
+      d.textContent = label;
+      feed.appendChild(d);
+    }
+
+    // ── 1. Open SSE first so the queue is subscribed before we fetch history.
+    //        This eliminates the race where an event arrives between history
+    //        fetch and SSE connection and gets missed.
     const es = new EventSource(`/stream/${TICKET_ID}`);
+    let historyLoaded = false;
 
     es.onopen = () => {
       feedStatus.textContent = 'connected';
       feedStatus.style.color = '#22c55e';
+
+      // ── 2. Fetch history now that we're subscribed.
+      if (historyLoaded) return;
+      historyLoaded = true;
+      fetch(`/tickets/${TICKET_ID}/events`)
+        .then(r => r.json())
+        .then(evts => {
+          if (evts.length === 0) return;
+          if (emptyEl) { emptyEl.remove(); emptyEl = null; }
+          evts.forEach(ev => feed.appendChild(makeRow(ev)));
+          insertDivider('─── live ───');
+          feed.scrollTop = feed.scrollHeight;
+        })
+        .catch(() => {});
     };
 
+    // ── 3. Live events arrive here after the divider.
     es.onmessage = (e) => {
-      try {
-        const ev = JSON.parse(e.data);
-        appendEvent(ev);
-      } catch {}
+      try { appendEvent(JSON.parse(e.data)); } catch {}
     };
 
     es.onerror = () => {

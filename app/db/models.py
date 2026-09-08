@@ -96,3 +96,37 @@ class Subtask(Base):
     )
 
     ticket: Mapped["Ticket"] = relationship("Ticket", back_populates="subtasks")
+
+
+class TicketEvent(Base):
+    """One structured event emitted during a ticket's lifecycle (R-7, R-23).
+
+    Every agent activation, tool call, guard decision, and stage transition is
+    persisted here so the UI can replay history after a reload and the audit
+    trail is never lost when subscribers disconnect.
+    """
+
+    __tablename__ = "ticket_events"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    ticket_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("tickets.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    subtask_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("subtasks.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    agent: Mapped[str] = mapped_column(String(64), nullable=False)
+    stage: Mapped[str] = mapped_column(String(64), nullable=False)
+    message: Mapped[str] = mapped_column(Text, nullable=False)
+    ts: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )

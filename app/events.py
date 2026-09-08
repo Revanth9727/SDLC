@@ -8,18 +8,23 @@ Design constraints:
 - Pure asyncio — no external broker, no threads (R-5: deterministic code only).
 - Per-ticket isolation: subscribe(ticket_id) only receives that ticket's events
   (R-4 extended to the event layer).
-- Ephemeral: events are in-memory queues only.  Audit persistence is a later
-  phase (R-12 does not require this module to persist; the checkpointer does).
+- Durable: log_event() persists every event to ``ticket_events`` in Postgres
+  before broadcasting, so a page reload replays history from the DB and the
+  in-memory queues carry only the live tail.
 - Never raises: publish silently drops events when there are no subscribers so
   tools are never blocked by stream consumers (R-11).
 """
 
 import asyncio
 import logging
+import uuid as _uuid_mod
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any, AsyncGenerator
+
+from app.db.connection import SessionLocal
+from app.db.models import TicketEvent
 
 logger = logging.getLogger(__name__)
 
@@ -103,3 +108,51 @@ async def subscribe(ticket_id: str) -> AsyncGenerator[asyncio.Queue, None]:
 def subscriber_count(ticket_id: str) -> int:
     """Return the number of active SSE subscribers for a ticket (useful in tests)."""
     return len(_subs.get(ticket_id, []))
+
+
+async def log_event(
+    ticket_id: str,
+    agent: str,
+    stage: str,
+    message: str,
+    *,
+    subtask_id: str | None = None,
+    **extra: Any,
+) -> dict[str, Any]:
+    """Persist an event to ticket_events AND publish it live (R-7, R-23).
+
+    This is the primary call-site for all agent activations, tool calls,
+    guard decisions, and stage transitions.  Use ``publish`` directly only
+    when you deliberately do NOT want durability (e.g. keepalive pings).
+    """
+    now = datetime.now(timezone.utc)
+    event = make_event(
+        agent=agent,
+        stage=stage,
+        message=message,
+        ticket_id=ticket_id,
+        subtask_id=subtask_id,
+        **extra,
+    )
+    event["ts"] = now.isoformat()  # use the same timestamp in DB and payload
+
+    # 1. Persist (synchronous — consistent with existing ORM pattern)
+    try:
+        with SessionLocal() as db:
+            db.add(
+                TicketEvent(
+                    ticket_id=_uuid_mod.UUID(ticket_id),
+                    subtask_id=_uuid_mod.UUID(subtask_id) if subtask_id else None,
+                    agent=agent,
+                    stage=stage,
+                    message=message,
+                    ts=now,
+                )
+            )
+            db.commit()
+    except Exception as exc:
+        logger.error("log_event: DB persist failed ticket=%r: %s", ticket_id, exc)
+
+    # 2. Broadcast live (never raises — R-11)
+    await publish(ticket_id, event)
+    return event
