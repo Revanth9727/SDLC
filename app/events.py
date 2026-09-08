@@ -58,9 +58,13 @@ def make_event(
 
 
 async def publish(ticket_id: str, event: dict[str, Any]) -> None:
-    """Broadcast event to all current subscribers for ticket_id.
+    """Broadcast event to live SSE subscribers only — NOT persisted to the DB.
 
-    Never raises.  Logs at DEBUG level so every tool call is traceable (R-7).
+    Prefer ``log_event()`` for all agent/tool events so history survives a
+    reload (R-7).  Use ``publish`` directly only for ephemeral signals such as
+    keepalive pings or transient UI hints that do not belong in the audit trail.
+
+    Never raises (R-11).
     """
     queues = list(_subs.get(ticket_id, []))
     logger.debug(

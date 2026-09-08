@@ -181,6 +181,22 @@ class _DebugEventBody(BaseModel):
     message: str = "manual test event"
 
 
+@app.get("/debug/emit/{ticket_id}", response_class=JSONResponse)
+async def debug_emit_events(ticket_id: str) -> JSONResponse:
+    """Emit 3 sequential fake agent events — persisted + live.  Open the ticket
+    page first, then hit this URL to watch events appear and survive a reload."""
+    pairs = [
+        ("diagnosis",  "started",    "reading repository files"),
+        ("diagnosis",  "root_cause", "found off-by-one in divide()"),
+        ("diagnosis",  "done",       "diagnosis complete — root cause recorded"),
+    ]
+    emitted = []
+    for agent, stage, msg in pairs:
+        e = await ev.log_event(ticket_id=ticket_id, agent=agent, stage=stage, message=msg)
+        emitted.append(e)
+    return JSONResponse(content={"emitted": emitted})
+
+
 @app.post("/debug/events/{ticket_id}", response_class=JSONResponse)
 async def debug_publish_event(ticket_id: str, body: _DebugEventBody) -> JSONResponse:
     """Persist + publish a test event — verifies both durability and live stream."""
