@@ -2,12 +2,14 @@
 
 Each cycle (every settings.jira_poll_interval_minutes):
   1. Overlap guard: skip tick if previous cycle still running.
-  2. Fetch Jira issues in status "To Do" (the ready signal).
-  3. For each, CLAIM atomically BEFORE any work:
+  2. Reconcile: check every in-scope ticket against Jira truth (R-28, §5b).
+     Fixes drift BEFORE claiming so cleared claims are re-picked this cycle.
+  3. Fetch Jira issues in status "To Do" (the ready signal).
+  4. For each, CLAIM atomically BEFORE any work:
        a. skip if tickets.claimed_at is already set
        b. insert/mark the ticket row with claimed_at = now
        c. flip Jira status to in_progress via JiraTool.set_status (R-25)
-  4. Emit a structured event per claimed ticket.
+  5. Emit a structured event per claimed ticket.
 
 Real agent processing (Planner etc.) is wired in later phases; "process" here
 means: persist the record and emit the event. Sequential for now (Phase 10 adds
@@ -26,6 +28,7 @@ from app.config import settings
 from app.db.connection import SessionLocal
 from app.db.models import Ticket
 from app.events import log_event as ev_log
+from app.core.reconcile import reconcile
 from app.tools.jira_tool import JiraTool
 
 logger = logging.getLogger(__name__)
@@ -74,6 +77,17 @@ async def start_loop(emit: Callable[[dict], Awaitable[None]]) -> asyncio.Task:
 
 async def _do_poll(emit: Callable[[dict], Awaitable[None]]) -> list[dict]:
     jira = JiraTool()
+
+    # Step 2: reconcile drift BEFORE claiming (R-28).
+    # Runs inside the overlap guard so it never races with itself.
+    try:
+        rec_events = await reconcile(jira)
+        for evt in rec_events:
+            await emit(evt)  # surface reconcile changes on the global stream too
+    except Exception as exc:
+        logger.error("poller: reconcile raised unexpectedly: %s", exc)
+
+    # Step 3: fetch and claim new "To Do" tickets.
     try:
         issues = jira.list_by_status(_JIRA_TODO_STATUS)
     except Exception as exc:

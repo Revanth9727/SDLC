@@ -5,6 +5,7 @@ its input and output (R-7).
 """
 
 import logging
+from datetime import datetime
 from typing import Any, TypedDict
 
 import httpx
@@ -27,6 +28,19 @@ class JiraTransition(TypedDict):
     id: str
     name: str  # destination status name, e.g. "In Progress"
     transition_name: str  # Jira workflow transition label, e.g. "Start progress"
+
+
+class JiraIssueDetail(TypedDict):
+    """Richer issue shape used by the reconciliation loop."""
+    key: str
+    summary: str
+    description: str
+    status: str
+    updated: str           # ISO-8601 string from Jira
+    assignee_id: str | None
+    assignee_name: str | None
+    reporter_id: str | None
+    reporter_name: str | None
 
 
 
@@ -239,6 +253,108 @@ class JiraTool:
             key, current_status, desired_name,
         )
         return {"applied": True, "from": current_status, "to": desired_name, "reason": None}
+
+    def get_issue_detail(self, key: str) -> JiraIssueDetail:
+        """Fetch a single issue with assignee, reporter and updated time (for reconcile)."""
+        logger.info("jira.get_issue_detail key=%r", key)
+        with self._client() as client:
+            resp = client.get(
+                f"/rest/api/3/issue/{key}",
+                params={"fields": "summary,description,status,assignee,reporter,updated"},
+            )
+            resp.raise_for_status()
+        fields = resp.json().get("fields", {})
+        summary, description = self._extract(fields)
+        status = (fields.get("status") or {}).get("name", "")
+        updated = fields.get("updated", "")
+        assignee = fields.get("assignee") or {}
+        reporter = fields.get("reporter") or {}
+        result = JiraIssueDetail(
+            key=key,
+            summary=summary,
+            description=description,
+            status=status,
+            updated=updated,
+            assignee_id=assignee.get("accountId"),
+            assignee_name=assignee.get("displayName"),
+            reporter_id=reporter.get("accountId"),
+            reporter_name=reporter.get("displayName"),
+        )
+        logger.info("jira.get_issue_detail -> status=%r", result["status"])
+        return result
+
+    def list_updated_since(self, since: datetime) -> list[JiraIssueDetail]:
+        """Return all project issues updated at or after ``since`` (UTC)."""
+        since_str = since.strftime("%Y-%m-%d %H:%M")
+        jql = (
+            f'project = {self._project} AND updated >= "{since_str}" '
+            f'ORDER BY updated ASC'
+        )
+        logger.info("jira.list_updated_since since=%r jql=%r", since_str, jql)
+        with self._client() as client:
+            resp = client.get(
+                "/rest/api/3/search/jql",
+                params={
+                    "jql": jql,
+                    "fields": "summary,description,status,assignee,reporter,updated",
+                    "maxResults": 100,
+                },
+            )
+            resp.raise_for_status()
+        results: list[JiraIssueDetail] = []
+        for item in resp.json().get("issues", []):
+            f = item.get("fields", {})
+            summary, description = self._extract(f)
+            assignee = f.get("assignee") or {}
+            reporter = f.get("reporter") or {}
+            results.append(JiraIssueDetail(
+                key=item["key"],
+                summary=summary,
+                description=description,
+                status=(f.get("status") or {}).get("name", ""),
+                updated=f.get("updated", ""),
+                assignee_id=assignee.get("accountId"),
+                assignee_name=assignee.get("displayName"),
+                reporter_id=reporter.get("accountId"),
+                reporter_name=reporter.get("displayName"),
+            ))
+        logger.info("jira.list_updated_since -> %d issue(s)", len(results))
+        return results
+
+    def comment_mentioning(
+        self,
+        key: str,
+        account_id: str | None,
+        display_name: str | None,
+        body_text: str,
+    ) -> None:
+        """Post a Jira comment, @mentioning the user if account_id is provided."""
+        logger.info("jira.comment_mentioning key=%r mention=%r", key, display_name)
+        if account_id:
+            para_content = [
+                {
+                    "type": "mention",
+                    "attrs": {
+                        "id": account_id,
+                        "text": f"@{display_name or account_id}",
+                        "accessLevel": "",
+                    },
+                },
+                {"type": "text", "text": f" {body_text}"},
+            ]
+        else:
+            para_content = [{"type": "text", "text": body_text}]
+        payload = {
+            "body": {
+                "version": 1,
+                "type": "doc",
+                "content": [{"type": "paragraph", "content": para_content}],
+            }
+        }
+        with self._client() as client:
+            resp = client.post(f"/rest/api/3/issue/{key}/comment", json=payload)
+            resp.raise_for_status()
+        logger.info("jira.comment_mentioning -> posted to %r", key)
 
     def comment(self, key: str, body: str) -> None:
         """Post a plain-text comment to the given Jira issue."""
