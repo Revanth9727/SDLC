@@ -20,6 +20,9 @@ class JiraIssue(TypedDict):
     key: str
     summary: str
     description: str
+    status: str  # Jira status name, e.g. "To Do", "In Progress"
+
+# TODO(1.4): add get_transitions(key) and set_status(key, internal_stage) here
 
 
 class JiraTool:
@@ -61,14 +64,16 @@ class JiraTool:
         with self._client() as client:
             resp = client.get(
                 "/rest/api/3/search",
-                params={"jql": jql, "fields": "summary,description", "maxResults": 50},
+                params={"jql": jql, "fields": "summary,description,status", "maxResults": 50},
             )
             resp.raise_for_status()
         issues: list[JiraIssue] = []
         for item in resp.json().get("issues", []):
-            summary, description = self._extract(item.get("fields", {}))
+            fields = item.get("fields", {})
+            summary, description = self._extract(fields)
+            status = (fields.get("status") or {}).get("name", "")
             issues.append(
-                JiraIssue(key=item["key"], summary=summary, description=description)
+                JiraIssue(key=item["key"], summary=summary, description=description, status=status)
             )
         logger.info("jira.list_open_issues -> %d issues", len(issues))
         return issues
@@ -79,12 +84,13 @@ class JiraTool:
         with self._client() as client:
             resp = client.get(
                 f"/rest/api/3/issue/{key}",
-                params={"fields": "summary,description"},
+                params={"fields": "summary,description,status"},
             )
             resp.raise_for_status()
         fields = resp.json().get("fields", {})
         summary, description = self._extract(fields)
-        result = JiraIssue(key=key, summary=summary, description=description)
+        status = (fields.get("status") or {}).get("name", "")
+        result = JiraIssue(key=key, summary=summary, description=description, status=status)
         logger.info("jira.get_issue -> %r", result)
         return result
 
