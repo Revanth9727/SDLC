@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Agentic SDLC</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <main>
+    <h1>Agentic SDLC</h1>
+
+    <section class="card">
+      <h2>Submit a ticket</h2>
+      <form method="post" action="/tickets">
+        <label for="title">Title</label>
+        <input id="title" name="title" type="text" placeholder="Short description of the task" required />
+
+        <label for="description">Description</label>
+        <textarea id="description" name="description" rows="4"
+                  placeholder="Full details, reproduce steps, expected behaviour…" required></textarea>
+
+        <button type="submit">Submit ticket</button>
+      </form>
+    </section>
+
+    <section class="card">
+      <h2>Tickets</h2>
+      {% if tickets %}
+      <table>
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Title</th>
+            <th>Status</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for ticket in tickets %}
+          <tr>
+            <td class="mono">{{ ticket.id }}</td>
+            <td>{{ ticket.title }}</td>
+            <td><span class="badge badge--{{ ticket.status }}">{{ ticket.status }}</span></td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% else %}
+      <p class="empty">No tickets yet — submit one above.</p>
+      {% endif %}
+    </section>
+  </main>
+</body>
+</html>
