@@ -17,6 +17,7 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
+from app import events as ev
 from app.core.poller import poll_cycle, start_loop
 from app.db.connection import SessionLocal
 from app.db.models import Ticket
@@ -146,6 +147,42 @@ async def poll_run_once() -> JSONResponse:
     """Manually trigger one poll cycle without waiting for the interval."""
     claimed = await poll_cycle(_broadcast)
     return JSONResponse(content={"claimed": claimed})
+
+
+@app.get("/stream/{ticket_id}")
+async def stream_ticket(ticket_id: str, request: Request) -> EventSourceResponse:
+    """Per-ticket SSE stream — emits every agent/tool event for this ticket (R-7, §9)."""
+    async def _stream():
+        async with ev.subscribe(ticket_id) as q:
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    event = await asyncio.wait_for(q.get(), timeout=20)
+                    yield {"data": json.dumps(event)}
+                except asyncio.TimeoutError:
+                    yield {"comment": "keepalive"}
+
+    return EventSourceResponse(_stream())
+
+
+class _DebugEventBody(BaseModel):
+    agent: str = "test"
+    stage: str = "test"
+    message: str = "manual test event"
+
+
+@app.post("/debug/events/{ticket_id}", response_class=JSONResponse)
+async def debug_publish_event(ticket_id: str, body: _DebugEventBody) -> JSONResponse:
+    """Publish a test event to a ticket stream — useful for manual SSE verification."""
+    event = ev.make_event(
+        agent=body.agent,
+        stage=body.stage,
+        message=body.message,
+        ticket_id=ticket_id,
+    )
+    await ev.publish(ticket_id, event)
+    return JSONResponse(content={"published": event, "subscribers": ev.subscriber_count(ticket_id)})
 
 
 @app.post("/ticket/{key}/confirm-repos", response_class=JSONResponse)

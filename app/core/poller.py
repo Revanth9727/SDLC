@@ -25,6 +25,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from app.config import settings
 from app.db.connection import SessionLocal
 from app.db.models import Ticket
+from app.events import make_event, publish as ev_publish
 from app.tools.jira_tool import JiraTool
 
 logger = logging.getLogger(__name__)
@@ -141,6 +142,18 @@ async def _claim_one(jira: JiraTool, issue: dict) -> dict | None:
         ticket_id = str(row.id)
 
     logger.info("poller: CLAIMED %r ticket_id=%s", key, ticket_id)
+
+    # Publish per-ticket event so /stream/{ticket_id} clients see it immediately.
+    await ev_publish(
+        ticket_id,
+        make_event(
+            agent="poller",
+            stage="claimed",
+            message=f"{key} claimed from Jira and recorded locally",
+            ticket_id=ticket_id,
+            key=key,
+        ),
+    )
 
     # 3c: flip Jira status — never raise on failure (R-11)
     try:
