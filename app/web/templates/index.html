@@ -100,15 +100,23 @@
           <p>No repos found automatically. Paste a GitHub repo URL:</p>
           <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap">
             <input id="paste-url" type="text" placeholder="https://github.com/owner/repo" style="width:22rem"/>
+            <input id="paste-token" type="password" autocomplete="off" placeholder="Private token if needed" style="width:16rem"/>
             <button type="button" onclick="confirmPaste()">Confirm</button>
           </div>
           <p id="confirm-msg" style="margin-top:0.5rem"></p>`;
       } else {
         const checks = data.candidates.map(r =>
-          `<label style="display:block;margin:0.25rem 0"><input type="checkbox" name="repo" value="${r}" checked> <code>${r}</code></label>`
+          `<div class="repo-choice">
+             <label><input type="checkbox" name="repo" value="${r}" checked> <code>${r}</code></label>
+             <input class="repo-token" data-repo="${r}" type="password" autocomplete="off" placeholder="Private token if needed" />
+           </div>`
         ).join('');
+        const privateMsg = data.code === 'private_repo_token_required' || data.source === 'private_repo'
+          ? '<p><span class="badge badge--needs_human">this repo is private — enter a token to access it</span></p>'
+          : '';
         body.innerHTML = `
           <p>Found via <strong>${data.source}</strong>:</p>
+          ${privateMsg}
           <div id="candidates">${checks}</div>
           <button type="button" onclick="confirmSelected()" style="margin-top:0.75rem">Confirm repos</button>
           <p id="confirm-msg" style="margin-top:0.5rem"></p>`;
@@ -118,23 +126,33 @@
     async function confirmSelected() {
       const checked = [...document.querySelectorAll('#candidates input[name=repo]:checked')].map(c => c.value);
       if (!checked.length) { alert('Select at least one repo'); return; }
-      await doConfirm(checked);
+      await doConfirm(checked, collectRepoTokens(checked));
     }
 
     async function confirmPaste() {
       const url = document.getElementById('paste-url').value.trim();
       const m = url.match(/github\.com\/([A-Za-z0-9_.\-]+\/[A-Za-z0-9_.\-]+)/);
       if (!m) { alert('Not a valid GitHub repo URL (expected github.com/owner/repo)'); return; }
-      await doConfirm([m[1]]);
+      const token = document.getElementById('paste-token')?.value.trim();
+      await doConfirm([m[1]], token ? {[m[1]]: token} : {});
     }
 
-    async function doConfirm(repos) {
+    function collectRepoTokens(repos) {
+      const tokens = {};
+      repos.forEach(repo => {
+        const input = document.querySelector(`.repo-token[data-repo="${CSS.escape(repo)}"]`);
+        if (input && input.value.trim()) tokens[repo] = input.value.trim();
+      });
+      return tokens;
+    }
+
+    async function doConfirm(repos, repo_tokens = {}) {
       const msg = document.getElementById('confirm-msg');
       msg.textContent = 'Saving…';
       const res = await fetch(`/ticket/${_resolveKey}/confirm-repos`, {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({repos})
+        body: JSON.stringify({repos, repo_tokens})
       });
       const data = await res.json();
       if (data.saved) {
@@ -142,6 +160,11 @@
         setTimeout(() => location.reload(), 1000);
       } else {
         msg.innerHTML = `<span class="badge badge--needs_human">${data.error}</span>`;
+        if (data.code === 'private_repo_token_required') renderResolve({
+          source: 'private_repo',
+          candidates: data.private_repos || repos,
+          code: data.code
+        });
       }
     }
 

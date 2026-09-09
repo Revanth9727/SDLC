@@ -32,6 +32,7 @@ form { display: flex; flex-direction: column; gap: 12px; }
 label { font-size: 0.85rem; font-weight: 600; color: #555; }
 
 input[type="text"],
+input[type="password"],
 textarea {
   width: 100%;
   padding: 9px 12px;
@@ -44,6 +45,7 @@ textarea {
   transition: border-color 0.15s;
 }
 input[type="text"]:focus,
+input[type="password"]:focus,
 textarea:focus {
   outline: none;
   border-color: #6366f1;
@@ -115,6 +117,24 @@ tbody td { padding: 10px 12px; }
 }
 
 .empty { color: #aaa; font-style: italic; font-size: 0.9rem; }
+
+.repo-choice {
+  display: grid;
+  grid-template-columns: minmax(12rem, 1fr) minmax(12rem, 16rem) auto;
+  gap: 0.5rem;
+  align-items: center;
+  margin: 0.4rem 0;
+}
+
+.repo-choice code {
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 640px) {
+  .repo-choice {
+    grid-template-columns: 1fr;
+  }
+}
 
 /* ── Ticket detail ──────────────────────────────────────────────── */
 .ticket-meta {

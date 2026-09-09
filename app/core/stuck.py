@@ -2,20 +2,23 @@
 
 Runs after reconciliation in each poll cycle, before the claim scan.
 
-For every active-category ticket whose duration exceeds STUCK_THRESHOLD_MINUTES:
+For every non-terminal Jira ticket whose duration exceeds STUCK_THRESHOLD_MINUTES:
   - AI-owned  → post a history-aware Jira comment stating what completed and where
                  it is stuck; do NOT change the Jira status (R-28).
-  - human-owned → post a "what's blocking?" comment referencing any history.
+  - human-owned/parked → post a "what's blocking / still needed?" comment
+                         referencing any history.
 
 Dedup guard: comment at most once per stuck episode.  ``last_stuck_comment_at``
-on the Ticket row tracks this; it is reset to NULL whenever a ticket transitions
-out of its stuck state (clear_claim, reclaim, superseded, or back to human_owned).
+on the Ticket row plus the last persisted stuck event's Jira status tracks this;
+a new Jira status is treated as a new episode, while repeated polls in the same
+status do not spam.
 
 Isolation: history is loaded by ``ticket_id`` only — never another ticket's data
 (R-4 extended to the reconciliation/stuck layer).
 """
 
 import logging
+import re
 import uuid as _uuid_mod
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta, timezone
@@ -23,7 +26,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import update as sa_update
 
 from app.config import settings
-from app.core.ownership import has_active_ai_run
+from app.core.ownership import has_active_ai_run, owner_of
 from app.db.connection import SessionLocal
 from app.db.models import Ticket, TicketEvent
 from app.events import log_event as ev_log
@@ -40,13 +43,13 @@ async def check_stuck(
     jira: JiraTool,
     emit: Callable[[dict], Awaitable[None]],
 ) -> list[dict]:
-    """Identify stuck active-category tickets and post informed Jira comments.
+    """Identify stuck non-terminal tickets and post informed Jira comments.
 
     Scope:
       (a) Locally claimed, AI-owned tickets whose ``claimed_at`` is older than
           the threshold — precise because we set the timestamp ourselves.
-      (b) Jira active-category tickets whose ``updated`` timestamp is older than the
-          threshold and which have no active AI claim — human-owned stuck proxy.
+      (b) Jira non-terminal tickets whose ``updated`` timestamp is older than the
+          threshold — covers active, ready, and parked statuses.
 
     Returns a list of event dicts (one per comment posted).
     Never raises — errors per ticket are logged and skipped (R-11).
@@ -80,11 +83,11 @@ async def check_stuck(
         except Exception as exc:
             logger.error("stuck: AI ticket %s error: %s", ticket.id, exc)
 
-    # ── (b) Human-owned: Jira active-category, not updated in > threshold ────
+    # ── (b) Human/parked: Jira non-terminal, not updated in > threshold ──────
     try:
-        human_candidates = jira.list_in_progress_stuck(settings.stuck_threshold_minutes)
+        human_candidates = jira.list_non_terminal_stuck(settings.stuck_threshold_minutes)
     except Exception as exc:
-        logger.warning("stuck: Jira active-category query failed: %s", exc)
+        logger.warning("stuck: Jira non-terminal query failed: %s", exc)
         human_candidates = []
 
     for detail in human_candidates:
@@ -96,16 +99,15 @@ async def check_stuck(
             ticket = db.query(Ticket).filter(Ticket.external_key == key).first()
 
         if ticket is None:
-            # Reconcile should have created a human_owned row this same cycle.
-            # If it hasn't (edge case on first cycle), skip — next cycle will catch it.
-            logger.debug("stuck: %r not yet in local DB — deferring to next cycle", key)
-            continue
+            ticket = _ensure_local_ticket(detail)
 
         if has_active_ai_run(ticket):
             continue  # covered in (a); active AI claim, not human-owned
 
         try:
-            evt = await _handle_stuck(jira, ticket, "human", now, emit)
+            detected_owner = owner_of(ticket, jira)
+            owner_for_comment = "human" if detected_owner in {"human", "none"} else detected_owner
+            evt = await _handle_stuck(jira, ticket, owner_for_comment, now, emit)
             if evt:
                 results.append(evt)
                 await emit(evt)
@@ -129,23 +131,44 @@ async def _handle_stuck(
 ) -> dict | None:
     """Post one stuck comment for a single ticket if not already done this episode."""
 
-    # Dedup guard — one comment per stuck episode (R-28).
-    if ticket.last_stuck_comment_at is not None:
-        logger.debug(
-            "stuck: %r already commented at %s — same episode, skipping",
-            ticket.external_key,
-            ticket.last_stuck_comment_at.isoformat(),
-        )
-        return None
-
     if not ticket.external_key:
         return None  # manual ticket with no Jira issue
 
-    # Fetch live detail for @mention (assignee → reporter fallback).
+    # Fetch live detail for status/category and @mention (assignee → reporter fallback).
     try:
         detail = jira.get_issue_detail(ticket.external_key)
     except Exception as exc:
         logger.warning("stuck: cannot fetch detail for %r: %s", ticket.external_key, exc)
+        return None
+
+    jira_status = detail["status"]
+    jira_category = detail.get("status_category")
+    if jira_category == "done":
+        logger.debug("stuck: %r is done-category — clearing stuck episode", ticket.external_key)
+        _clear_stuck_episode(ticket)
+        return None
+
+    threshold_mins = settings.stuck_threshold_minutes
+    if not _is_jira_stale(detail, now, threshold_mins):
+        logger.debug(
+            "stuck: %r status=%r changed recently — under threshold, skipping",
+            ticket.external_key,
+            jira_status,
+        )
+        return None
+
+    # Dedup guard — one comment per stuck episode/status (R-28).
+    last_episode_status = _last_stuck_episode_status(str(ticket.id))
+    if (
+        ticket.last_stuck_comment_at is not None
+        and last_episode_status == jira_status
+    ):
+        logger.debug(
+            "stuck: %r already commented at %s for status=%r — same episode, skipping",
+            ticket.external_key,
+            ticket.last_stuck_comment_at.isoformat(),
+            jira_status,
+        )
         return None
 
     account_id = detail.get("assignee_id") or detail.get("reporter_id")
@@ -155,23 +178,23 @@ async def _handle_stuck(
     history = _load_history(str(ticket.id))
     context = _history_context(history)
 
-    threshold_mins = settings.stuck_threshold_minutes
-
     if owner == "ai":
         elapsed_mins = int((now - ticket.claimed_at).total_seconds() / 60)
         comment_body = (
-            f"⚠️ Automated system notice: the AI agent has held this ticket for "
-            f"{elapsed_mins} min (threshold: {threshold_mins} min). "
+            f"Automated system notice: the AI agent has held this ticket in "
+            f"'{jira_status}' for {elapsed_mins} min "
+            f"(threshold: {threshold_mins} min). "
             f"{context}"
             "Jira status intentionally unchanged — please review and re-queue or "
             "reassign if needed."
         )
     else:
+        duration_text = _duration_since_updated(detail, now) or f"over {threshold_mins} min"
         comment_body = (
-            f"Automated system notice: this ticket has been active in Jira for "
-            f"over {threshold_mins} min with no recent updates. "
+            f"Automated system notice: this has been in '{jira_status}' for "
+            f"{duration_text} with no recent updates. "
             f"{context}"
-            "What's blocking? Any update helps keep the board accurate."
+            "Is this still needed, blocked, or ready to move? Any update helps keep the board accurate."
         )
 
     # Post comment — never raises, never changes Jira status (R-11, R-28).
@@ -199,11 +222,14 @@ async def _handle_stuck(
         agent="stuck_detector",
         stage="stuck_comment_posted",
         message=(
-            f"{ticket.external_key} stuck ({owner}): comment posted "
-            f"@{display_name} — {context.strip()}"
+            f"{ticket.external_key} stuck ({owner}) jira_status={jira_status!r} "
+            f"jira_category={jira_category!r}: comment posted @{display_name} — "
+            f"{context.strip()}"
         ),
         key=ticket.external_key,
         owner=owner,
+        jira_status=jira_status,
+        jira_category=jira_category,
     )
 
 
@@ -220,6 +246,86 @@ def _load_history(ticket_id: str) -> list[TicketEvent]:
             .order_by(TicketEvent.ts.asc())
             .all()
         )
+
+
+def _ensure_local_ticket(detail: JiraIssueDetail) -> Ticket:
+    """Create a local tracking row for a stale Jira ticket if needed."""
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+    with SessionLocal() as db:
+        ins = db.execute(
+            pg_insert(Ticket)
+            .values(
+                source="jira",
+                external_key=detail["key"],
+                title=detail["summary"],
+                description=detail["description"],
+                status="human_owned",
+            )
+            .on_conflict_do_update(
+                index_elements=["external_key"],
+                index_where=Ticket.external_key.is_not(None),
+                set_={"status": "human_owned"},
+            )
+            .returning(Ticket.id)
+        )
+        db.commit()
+        ticket_id = ins.first()[0]
+
+    with SessionLocal() as db:
+        return db.query(Ticket).filter(Ticket.id == ticket_id).first()
+
+
+def _clear_stuck_episode(ticket: Ticket) -> None:
+    with SessionLocal() as db:
+        db.execute(
+            sa_update(Ticket)
+            .where(Ticket.id == ticket.id)
+            .values(last_stuck_comment_at=None)
+        )
+        db.commit()
+
+
+def _last_stuck_episode_status(ticket_id: str) -> str | None:
+    """Return the Jira status recorded by this ticket's latest stuck event."""
+    events = _load_history(ticket_id)
+    for event in reversed(events):
+        if event.agent != "stuck_detector" or event.stage != "stuck_comment_posted":
+            continue
+        match = re.search(r"jira_status='([^']*)'", event.message)
+        if match:
+            return match.group(1)
+        return None
+    return None
+
+
+def _duration_since_updated(detail: JiraIssueDetail, now: datetime) -> str | None:
+    updated_dt = _parse_jira_updated(detail)
+    if updated_dt is None:
+        return None
+    minutes = max(0, int((now - updated_dt).total_seconds() / 60))
+    if minutes < 60:
+        return f"{minutes} min"
+    hours = minutes // 60
+    rem = minutes % 60
+    return f"{hours} hr {rem} min"
+
+
+def _is_jira_stale(detail: JiraIssueDetail, now: datetime, threshold_mins: int) -> bool:
+    updated_dt = _parse_jira_updated(detail)
+    if updated_dt is None:
+        return True
+    return now - updated_dt >= timedelta(minutes=threshold_mins)
+
+
+def _parse_jira_updated(detail: JiraIssueDetail) -> datetime | None:
+    updated = detail.get("updated")
+    if not updated:
+        return None
+    try:
+        return datetime.fromisoformat(updated).astimezone(timezone.utc)
+    except ValueError:
+        return None
 
 
 def _history_context(events: list[TicketEvent]) -> str:

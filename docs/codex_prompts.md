@@ -452,7 +452,8 @@ curl -s localhost:8000/debug/ownership/SCRUM-2 | python3 -m json.tool   # -> "hu
 ```
 Add stuck detection to the poll cycle, per architecture.md §5b and ai_rules.md
 R-28. Config: STUCK_THRESHOLD_MINUTES (default 120) in settings.
-For each ticket In Progress longer than the threshold:
+For each ticket in ANY non-terminal status (category != "done" — includes In Progress
+AND parked statuses like On-Hold) longer than the threshold:
   1. READ THAT TICKET'S OWN history/events first (isolation: only this ticket's
      data, never another's) to determine what stage it reached and what happened.
   2. Branch on owner_of():
@@ -539,14 +540,18 @@ EOF
 **PROMPT**
 ```
 Extend app/tools/github_tool.py (or a new repo_tool.py) with read capability:
-- clone_or_pull(full_name) -> local path to a fresh checkout of the given
-  "owner/repo" default branch (shallow clone to a temp dir keyed by repo; reuse if
-  present). The repo comes from the sub-task's `repo` field (assigned by the
-  Planner), NOT a hardcoded one — for this early phase you may pass the sandbox repo
-  explicitly while the Planner isn't built yet.
+- clone_or_pull(full_name, subtask_id) -> local path to a FRESH SHALLOW checkout
+  (git clone --depth 1) of the given "owner/repo" default branch, into an ISOLATED
+  per-sub-task dir (e.g. /tmp/agentic-workspaces/{subtask_id}/). Pull fresh if reused
+  within an active run. The repo comes from the sub-task's `repo` field (assigned by
+  the Planner), NOT hardcoded — for this early phase you may pass the sandbox repo
+  explicitly while the Planner isn't built yet. Per architecture.md §8a and R-39.
+- cleanup_workspace(subtask_id): delete the sub-task's workspace dir. Called when the
+  sub-task reaches a resting state (PR opened / escalated / abandoned) — NOT mid retry
+  loop. Re-clone fresh on any reopen.
 - list_files(full_name) and read_file(full_name, path) within that checkout.
 These are deterministic tools. End by telling me how to print the repo's file list
-and app.py contents.
+and app.py contents, and how to confirm the workspace is deleted after cleanup.
 ```
 
 **SEE** — your sandbox repo's files (including the buggy `app.py`) readable in-app.

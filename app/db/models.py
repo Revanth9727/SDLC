@@ -133,3 +133,17 @@ class TicketEvent(Base):
         nullable=False,
         default=lambda: datetime.now(timezone.utc),
     )
+
+
+class RepoToken(Base):
+    """Encrypted per-repo GitHub token for private repo access (R-17)."""
+
+    __tablename__ = "repo_tokens"
+
+    owner_repo: Mapped[str] = mapped_column(String(256), primary_key=True)
+    encrypted_token: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )

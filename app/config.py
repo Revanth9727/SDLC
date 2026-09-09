@@ -15,6 +15,9 @@ class Settings(BaseSettings):
     github_token: str
     github_owner: str
     github_repo: str
+    app_encryption_key: str = ""
+    workspace_root: str = ""
+    repo_cache_dir: str = ""
     jira_base_url: str
     jira_email: str
     jira_api_token: str

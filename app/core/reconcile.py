@@ -152,6 +152,8 @@ async def _reconcile_one(
             db.query(Ticket).filter(Ticket.external_key == key).first()
         )
 
+    content_event = await _refresh_local_content(key, local, detail)
+
     # ── Rule 1: claimed locally but Jira dragged back to a ready status ─────
     if local and local.claimed_at and jira_category == _CATEGORY_NEW:
         return await _clear_claim(key, local, detail)
@@ -173,6 +175,9 @@ async def _reconcile_one(
     if jira_category not in _KNOWN_CATEGORIES:
         return await _escalate_unknown(jira, key, local, detail)
 
+    if content_event:
+        return content_event
+
     # ── Rule 6: everything in sync — no-op ──────────────────────────────────
     logger.debug(
         "reconcile: %r status=%r category=%r — no drift",
@@ -186,6 +191,38 @@ async def _reconcile_one(
 # ---------------------------------------------------------------------------
 # Drift handlers
 # ---------------------------------------------------------------------------
+
+async def _refresh_local_content(
+    key: str,
+    local: "Ticket | None",
+    detail: JiraIssueDetail,
+) -> dict | None:
+    """Mirror Jira's current summary/description into the local ticket row."""
+    if local is None:
+        return None
+
+    new_title = detail["summary"]
+    new_description = detail["description"]
+    if local.title == new_title and local.description == new_description:
+        return None
+
+    with SessionLocal() as db:
+        db.execute(
+            sa_update(Ticket)
+            .where(Ticket.id == local.id)
+            .values(title=new_title, description=new_description)
+        )
+        db.commit()
+
+    logger.info("reconcile: CONTENT_REFRESHED %r", key)
+    return await ev_log(
+        ticket_id=str(local.id),
+        agent="reconcile",
+        stage="content_refreshed",
+        message=f"{key} title/description refreshed from current Jira issue content",
+        key=key,
+    )
+
 
 async def _clear_claim(
     key: str,

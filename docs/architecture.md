@@ -291,15 +291,21 @@ check: **is there an active AI run for it in the DB?** Active run → AI owns it
 active run but In Progress → a human owns it. This single check arbitrates every
 human-vs-AI decision.
 
-**Stuck detection + smart comment.** A ticket In Progress longer than
+**Stuck detection + smart comment.** A ticket in ANY non-terminal status (any category
+that is not `done` — including In Progress AND parked statuses like On-Hold) longer than
 `STUCK_THRESHOLD_MINUTES` (configurable) is examined by ownership, AFTER reading its
 history:
 - **AI-owned and wedged** → comment stating what was completed and where it stuck (do
   NOT change the Jira status — respect the human's board); @mention the owner.
-- **Human-owned and stalled** → comment asking the human what's blocking, referencing
-  what's already been done; @mention the owner.
+- **Human-owned and stalled/parked** → comment asking what's blocking or what the plan
+  is (e.g. "this has been parked in On-Hold for N — still needed, or ready to move?"),
+  referencing what's already been done; @mention the owner.
 - **Healthy in-flight AI run** → never nag.
 - **Comment once per stuck episode** — don't repeat until the situation changes.
+
+So the supervisor never *silently* forgets a ticket: anything non-done that sits too long
+gets a nudge. It just waits for the threshold rather than commenting the instant a human
+parks something (which would be noise — they just moved it on purpose).
 
 The push signal stays **To Do** — reconciliation is what makes a human dragging a ticket
 back to To Do (or reopening a closed one) reliably re-trigger the supervisor.
@@ -555,6 +561,42 @@ corruption is impossible.
 
 **Deferred (designed-for, not built early):** AST-based editing for structured config
 files (JSON/YAML/TOML); script-generation for very large (>1000-line) files.
+
+---
+
+## 8a. Workspaces (ephemeral scratch — the laptop holds nothing durable)
+
+Code is edited in a **local clone**, but the clone is pure, throwaway **scratch space**.
+Everything durable lives elsewhere: the **change** is pushed to a GitHub branch/PR
+(source of truth for code); the **summary of what was done** is on the Jira ticket and in
+the DB event history (source of truth for the narrative). So the clone has zero lasting
+value after the push — deleting it loses nothing.
+
+**Isolation.** Each sub-task gets its own clone directory (e.g.
+`/tmp/agentic-workspaces/<ticket>_<subtask>/`), its own branch. Sub-tasks never share a
+working directory, so concurrent work can't stomp on each other's files — file-level
+isolation matching the state-level isolation.
+
+**Freshness (R-20).** Because diagnosis may happen long before the human approves, the
+Executor **clones/pulls fresh right before editing**, never trusting a stale clone from
+diagnosis time.
+
+**Space — the key property.** Clones are **shallow** (`--depth 1`: latest commit only,
+not full history) and **deleted when the sub-task reaches a resting state** — PR opened
+(success), escalated to human, or abandoned. During an active retry loop
+(Critic-reject → re-edit, test-fail → retry) the clone is kept until the loop resolves,
+then deleted. A later reopen/retry **re-clones fresh** (cheap, and freshness-correct).
+Because clones never accumulate — they exist only during active editing — disk usage
+stays near-zero regardless of ticket volume. A **disk/workspace guard** pauses and alerts
+if space runs low rather than filling the disk (R-11 applied to disk).
+
+**Why this works:** the clone was never the memory — the ticket + DB summary are. A
+future re-pickup reads that summary to understand history without needing the old clone.
+The laptop is pure compute scratch.
+
+**Deferred (scale option):** a shared per-repo cache + git **worktrees** (isolated
+working dirs sharing one set of git objects) instead of independent clones — only if
+clone time/space is ever a *measured* bottleneck.
 
 ---
 

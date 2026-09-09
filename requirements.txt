@@ -7,6 +7,7 @@ python-multipart==0.0.*
 
 # agents / orchestration
 langgraph==0.2.*
+langgraph-checkpoint-postgres==1.*
 langchain-core==0.3.*
 openai==1.54.*
 
@@ -19,6 +20,7 @@ pgvector==0.3.*
 pydantic==2.9.*
 pydantic-settings==2.6.*
 python-dotenv==1.0.*
+cryptography>=42
 
 # integrations
 PyGithub==2.5.*

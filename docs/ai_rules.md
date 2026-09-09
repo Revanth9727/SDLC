@@ -184,11 +184,13 @@ never another ticket's data. Before ANY comment, read the ticket's history and s
 what's actually done. **Escalation must never fail on missing config:** always post a
 comment, always @mention the owner (assignee else reporter), TRY to set a human/blocked
 status but skip silently if unmapped (R-25), email deferred — even with every status
-missing, comment + @mention reach a human. Stuck In Progress beyond
-`STUCK_THRESHOLD_MINUTES`: AI-owned → history-aware "what completed / where stuck"
-comment (no status change); human-owned → "what's blocking?" comment; healthy run →
-never nag; once per episode. Push signal is To Do; reconciliation makes a drag-back or a
-reopen reliably re-trigger the supervisor.
+missing, comment + @mention reach a human. Stuck in ANY non-terminal status (not `done` category — In Progress OR parked like
+On-Hold) beyond `STUCK_THRESHOLD_MINUTES`: AI-owned → history-aware "what completed /
+where stuck" comment (no status change); human-owned/parked → "what's blocking / still
+needed?" comment; healthy run → never nag; once per episode. So the supervisor never
+silently forgets a non-done ticket — it nudges after the threshold (not instantly, which
+would be noise). Push signal is To Do; reconciliation makes a drag-back or a reopen
+reliably re-trigger the supervisor.
 
 **R-29. Solution reuse is tiered — skip reasoning, never skip safety.**
 Before running the reasoning agents, memory searches top-K resolved tickets. On a strong
@@ -281,6 +283,36 @@ check — only the assignee or a configured allow-list/role may approve; an unau
 reply is refused, never actioned (an approval anyone can trigger is not an approval, and
 this is R-30's "the right human asks" made concrete). Both channels resume via the same
 path; never double-apply.
+
+**R-39. Workspaces are ephemeral scratch — nothing durable on the laptop.**
+Code is edited in a local clone that is pure throwaway: the change lives in the GitHub
+branch/PR, the summary lives on the Jira ticket + DB. Each sub-task gets its own isolated
+clone dir + branch (no shared working dirs). Clone SHALLOW (`--depth 1`) and pull/clone
+FRESH right before editing (R-20). DELETE the clone when the sub-task reaches a resting
+state (PR opened / escalated / abandoned); keep it during an active retry loop, then
+delete; re-clone fresh on any reopen. Because clones never accumulate, disk stays
+near-zero at any ticket volume. A disk/workspace guard pauses + alerts if space runs low
+(R-11). Shared per-repo cache + git worktrees is a deferred scale option, only if
+measured.
+
+**R-40. Narrate every meaningful step on the Jira ticket.**
+The ticket is the audit trail. At each meaningful step boundary the tool posts a comment
+stating what it did or found — repo resolved ("using `owner/repo`"), diagnosis done
+("found `<root cause>` in `<file>`"), plan ready (the approve prompt), edit+tests done
+("applied fix, tests passed/failed"), PR opened ("PR #N: `<link>`"), and ANY failure or
+block ("blocked: `<what and why>`"). Comment at step boundaries, ONE per completed step
+with the result in it — not per micro-action (no "reading file"/"calling LLM" noise). The
+test: would a human teammate post this as a progress update? So anyone reading the ticket
+sees the full journey. Reads only that ticket's own data (isolation).
+
+**R-41. Validate the repo before use — refuse and surface if invalid.**
+Before accepting/using a resolved repo, verify it's reachable via GitHub
+(GitHubTool.get_repo). If it doesn't exist or the token can't access it: REFUSE it (don't
+silently accept), post a Jira comment naming the problem ("repo `owner/repo` not found or
+not accessible"), flag needs_human, and block until a valid repo is provided. Same for a
+missing/empty repo or a clone failure at diagnosis — surface it (UI + Jira comment +
+needs_human), never silently proceed or no-op. This is R-11 ("never fail silently")
+applied to repos.
 
 ---
 

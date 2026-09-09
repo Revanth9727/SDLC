@@ -6,7 +6,7 @@ its input and output (R-7).
 
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Any, TypedDict
+from typing import Any, NotRequired, TypedDict
 
 import httpx
 
@@ -27,6 +27,7 @@ class JiraIssue(TypedDict):
     description: str
     status: str  # Jira status name, e.g. "To Do", "In Progress"
     status_category: str | None  # Jira statusCategory.key: new | indeterminate | done
+    raw_fields: NotRequired[dict[str, Any]]
 
 
 class JiraTransition(TypedDict):
@@ -48,6 +49,7 @@ class JiraIssueDetail(TypedDict):
     assignee_name: str | None
     reporter_id: str | None
     reporter_name: str | None
+    raw_fields: NotRequired[dict[str, Any]]
 
 
 
@@ -95,14 +97,57 @@ class JiraTool:
     def _extract(self, fields: dict) -> tuple[str, str]:
         """Pull summary and plain-text description from an issue's fields dict."""
         summary = fields.get("summary", "")
-        desc_root = fields.get("description") or {}
-        lines: list[str] = []
-        for block in desc_root.get("content", []):
-            for inline in block.get("content", []):
-                if inline.get("type") == "text":
-                    lines.append(inline.get("text", ""))
-        description = " ".join(lines).strip()
+        description = self.extract_plain_text(fields.get("description"))
         return summary, description
+
+    @classmethod
+    def extract_plain_text(cls, value: Any) -> str:
+        """Extract searchable plain text from Jira ADF or plain JSON-ish fields."""
+        parts: list[str] = []
+        cls._collect_text(value, parts)
+        return " ".join(part.strip() for part in parts if part and part.strip()).strip()
+
+    @classmethod
+    def _collect_text(cls, value: Any, parts: list[str]) -> None:
+        if value is None:
+            return
+        if isinstance(value, str):
+            parts.append(value)
+            return
+        if isinstance(value, (int, float, bool)):
+            parts.append(str(value))
+            return
+        if isinstance(value, list):
+            for item in value:
+                cls._collect_text(item, parts)
+            return
+        if not isinstance(value, dict):
+            return
+
+        node_type = value.get("type")
+        text = value.get("text")
+        if isinstance(text, str):
+            parts.append(text)
+        if node_type == "mention":
+            attrs = value.get("attrs") or {}
+            label = attrs.get("text") or attrs.get("displayName")
+            if isinstance(label, str):
+                parts.append(label)
+        if node_type in {"inlineCard", "blockCard"}:
+            attrs = value.get("attrs") or {}
+            url = attrs.get("url")
+            if isinstance(url, str):
+                parts.append(url)
+
+        for key in ("content", "attrs"):
+            nested = value.get(key)
+            if key == "attrs" and isinstance(nested, dict):
+                for attr_key in ("url", "href", "title", "alt"):
+                    attr_val = nested.get(attr_key)
+                    if isinstance(attr_val, str):
+                        parts.append(attr_val)
+                continue
+            cls._collect_text(nested, parts)
 
     def _status_category_from_fields(self, fields: dict) -> str | None:
         status = fields.get("status") or {}
@@ -217,12 +262,12 @@ class JiraTool:
         return issues
 
     def get_issue(self, key: str) -> JiraIssue:
-        """Fetch a single Jira issue by key (e.g. 'SANDBOX-1')."""
+        """Fetch a single Jira issue by key with full fields."""
         logger.info("jira.get_issue key=%r", key)
         with self._client() as client:
             resp = client.get(
                 f"/rest/api/3/issue/{key}",
-                params={"fields": "summary,description,status"},
+                params={"fields": "*all"},
             )
             resp.raise_for_status()
         fields = resp.json().get("fields", {})
@@ -234,9 +279,39 @@ class JiraTool:
             description=description,
             status=status,
             status_category=self._status_category_from_fields(fields),
+            raw_fields=fields,
         )
         logger.info("jira.get_issue -> %r", result)
         return result
+
+    def get_issue_text_fields(self, key: str) -> dict[str, str]:
+        """Return searchable current Jira text fields for one issue.
+
+        Reads only the requested issue. Description and comments are ADF in Jira
+        Cloud, so they are flattened into text before URL scanning.
+        """
+        issue = self.get_issue(key)
+        fields = issue.get("raw_fields", {})
+        texts = {
+            "summary": issue["summary"],
+            "description": issue["description"],
+            "environment": self.extract_plain_text(fields.get("environment")),
+            "comments": self._comments_text(key),
+        }
+        logger.info(
+            "jira.get_issue_text_fields key=%r lengths=%r",
+            key,
+            {name: len(value) for name, value in texts.items()},
+        )
+        return texts
+
+    def _comments_text(self, key: str) -> str:
+        with self._client() as client:
+            resp = client.get(f"/rest/api/3/issue/{key}/comment", params={"maxResults": 100})
+            resp.raise_for_status()
+        comments = resp.json().get("comments", [])
+        bodies = [self.extract_plain_text(comment.get("body")) for comment in comments]
+        return " ".join(body for body in bodies if body)
 
     def list_by_status(self, status_name: str) -> list[JiraIssue]:
         """Return issues for the configured project with exactly ``status_name``."""
@@ -436,12 +511,12 @@ class JiraTool:
         return {"applied": True, "from": current_status, "to": desired_name, "reason": None}
 
     def get_issue_detail(self, key: str) -> JiraIssueDetail:
-        """Fetch a single issue with assignee, reporter and updated time (for reconcile)."""
+        """Fetch a single issue with full fields plus reconcile metadata."""
         logger.info("jira.get_issue_detail key=%r", key)
         with self._client() as client:
             resp = client.get(
                 f"/rest/api/3/issue/{key}",
-                params={"fields": "summary,description,status,assignee,reporter,updated"},
+                params={"fields": "*all"},
             )
             resp.raise_for_status()
         fields = resp.json().get("fields", {})
@@ -462,6 +537,7 @@ class JiraTool:
             assignee_name=assignee.get("displayName"),
             reporter_id=reporter.get("accountId"),
             reporter_name=reporter.get("displayName"),
+            raw_fields=fields,
         )
         logger.info("jira.get_issue_detail -> status=%r", result["status"])
         return result
@@ -479,7 +555,7 @@ class JiraTool:
                 "/rest/api/3/search/jql",
                 params={
                     "jql": jql,
-                    "fields": "summary,description,status,assignee,reporter,updated",
+                    "fields": "*all",
                     "maxResults": 100,
                 },
             )
@@ -501,6 +577,7 @@ class JiraTool:
                 assignee_name=assignee.get("displayName"),
                 reporter_id=reporter.get("accountId"),
                 reporter_name=reporter.get("displayName"),
+                raw_fields=f,
             ))
         logger.info("jira.list_updated_since -> %d issue(s)", len(results))
         return results
@@ -540,21 +617,21 @@ class JiraTool:
             resp.raise_for_status()
         logger.info("jira.comment_mentioning -> posted to %r", key)
 
-    def list_in_progress_stuck(self, threshold_minutes: int) -> list["JiraIssueDetail"]:
-        """Return active-category issues whose ``updated`` timestamp is older than
+    def list_non_terminal_stuck(self, threshold_minutes: int) -> list["JiraIssueDetail"]:
+        """Return non-terminal issues whose ``updated`` timestamp is older than
         ``threshold_minutes``.
 
-        Fetches all active-category issues and filters by parsed timestamp in Python
+        Fetches all new/active-category issues and filters by parsed timestamp in Python
         rather than relying on JQL relative-date syntax (portability across Jira
         versions).  Capped at 100 results.
         """
         status_names = [
             name
             for name, category in self.fetch_project_statuses(force_refresh=True).items()
-            if category == _CATEGORY_ACTIVE
+            if category in {_CATEGORY_NEW, _CATEGORY_ACTIVE}
         ]
         if not status_names:
-            logger.info("jira.list_in_progress_stuck: no active-category statuses configured in Jira")
+            logger.info("jira.list_non_terminal_stuck: no non-terminal statuses configured in Jira")
             return []
 
         quoted = ", ".join(f'"{name}"' for name in status_names)
@@ -562,7 +639,7 @@ class JiraTool:
             f"project = {self._project} AND status in ({quoted}) "
             f"ORDER BY updated ASC"
         )
-        logger.info("jira.list_in_progress_stuck threshold_minutes=%d jql=%r", threshold_minutes, jql)
+        logger.info("jira.list_non_terminal_stuck threshold_minutes=%d jql=%r", threshold_minutes, jql)
         with self._client() as client:
             resp = client.get(
                 "/rest/api/3/search/jql",
@@ -606,8 +683,12 @@ class JiraTool:
                 reporter_name=reporter.get("displayName"),
             ))
 
-        logger.info("jira.list_in_progress_stuck -> %d stuck issue(s)", len(results))
+        logger.info("jira.list_non_terminal_stuck -> %d stuck issue(s)", len(results))
         return results
+
+    def list_in_progress_stuck(self, threshold_minutes: int) -> list["JiraIssueDetail"]:
+        """Compatibility alias; stuck detection now covers all non-terminal statuses."""
+        return self.list_non_terminal_stuck(threshold_minutes)
 
     def comment(self, key: str, body: str) -> None:
         """Post a plain-text comment to the given Jira issue."""

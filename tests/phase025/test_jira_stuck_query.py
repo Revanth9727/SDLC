@@ -32,7 +32,7 @@ class _FakeClient:
         if _path == "/rest/api/3/project/SCRUM/statuses":
             return _FakeResponse(self.statuses_payload)
         assert _path == "/rest/api/3/search/jql"
-        assert 'status in ("In Progress", "On Hold")' in params["jql"]
+        assert 'status in ("To Do", "In Progress", "On Hold")' in params["jql"]
         return _FakeResponse(self.search_payload)
 
 
@@ -50,7 +50,7 @@ def _issue(key: str, updated: datetime) -> dict:
     }
 
 
-def test_list_in_progress_stuck_filters_recent_updates(monkeypatch) -> None:
+def test_list_non_terminal_stuck_filters_recent_updates(monkeypatch) -> None:
     now = datetime.now(timezone.utc)
     payload = {
         "issues": [
@@ -85,7 +85,7 @@ def test_list_in_progress_stuck_filters_recent_updates(monkeypatch) -> None:
     ]
     monkeypatch.setattr(tool, "_client", lambda: _FakeClient(payload, statuses_payload))
 
-    results = tool.list_in_progress_stuck(120)
+    results = tool.list_non_terminal_stuck(120)
 
     assert [item["key"] for item in results] == ["SCRUM-OLD"]
     assert results[0]["assignee_name"] == "Assignee"

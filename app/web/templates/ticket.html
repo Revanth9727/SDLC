@@ -31,7 +31,24 @@
       {% if ticket.description %}
       <div class="description-box">{{ ticket.description }}</div>
       {% endif %}
+
+      <button type="button" id="diagnose-btn">Run diagnosis</button>
+      <span id="diagnose-status" style="margin-left:0.75rem;font-size:0.85rem;color:#666;"></span>
     </section>
+
+    {% if ticket.external_key and ticket.repos %}
+    <section class="card">
+      <h2>Private repo access</h2>
+      {% for repo in ticket.repos %}
+      <div class="repo-choice">
+        <code>{{ repo }}</code>
+        <input class="repo-token" data-repo="{{ repo }}" type="password" autocomplete="off" placeholder="Token for private access" />
+        <button type="button" onclick="saveRepoToken('{{ repo }}')">Save token</button>
+      </div>
+      {% endfor %}
+      <p id="token-status" style="margin-top:0.5rem;font-size:0.85rem;color:#666;"></p>
+    </section>
+    {% endif %}
 
     <section class="card">
       <h2>
@@ -49,6 +66,9 @@
     const TICKET_ID = "{{ ticket.id }}";
     const feed = document.getElementById('activity-feed');
     const feedStatus = document.getElementById('feed-status');
+    const diagnoseBtn = document.getElementById('diagnose-btn');
+    const diagnoseStatus = document.getElementById('diagnose-status');
+    const tokenStatus = document.getElementById('token-status');
     let emptyEl = document.getElementById('feed-empty');
 
     function fmtTime(isoStr) {
@@ -116,6 +136,42 @@
       feedStatus.textContent = 'reconnecting…';
       feedStatus.style.color = '#f59e0b';
     };
+
+    diagnoseBtn.addEventListener('click', async () => {
+      diagnoseBtn.disabled = true;
+      diagnoseStatus.textContent = 'running…';
+      try {
+        const res = await fetch(`/tickets/${TICKET_ID}/diagnose`, {method: 'POST'});
+        const data = await res.json();
+        diagnoseStatus.textContent = data.status || data.error || 'done';
+        if (data.code === 'private_repo_token_required') {
+          diagnoseStatus.textContent = 'this repo is private — enter a token to access it';
+        }
+      } catch {
+        diagnoseStatus.textContent = 'error — see server logs';
+      } finally {
+        diagnoseBtn.disabled = false;
+      }
+    });
+
+    async function saveRepoToken(repo) {
+      const input = document.querySelector(`.repo-token[data-repo="${CSS.escape(repo)}"]`);
+      const token = input?.value.trim();
+      if (!token) { alert('Enter a token first'); return; }
+      tokenStatus.textContent = 'Saving…';
+      const res = await fetch(`/ticket/{{ ticket.external_key }}/confirm-repos`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({repos: [repo], repo_tokens: {[repo]: token}})
+      });
+      const data = await res.json();
+      if (data.saved) {
+        input.value = '';
+        tokenStatus.textContent = 'Token saved. It will not be shown again.';
+      } else {
+        tokenStatus.textContent = data.error || 'Could not save token';
+      }
+    }
   </script>
 </body>
 </html>
