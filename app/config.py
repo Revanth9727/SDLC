@@ -1,3 +1,4 @@
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -56,6 +57,15 @@ class Settings(BaseSettings):
     # Guard pauses and escalates when either ceiling is exceeded.
     ticket_call_budget: int = 40
     ticket_cost_budget_usd: float = 2.00
+
+    max_agent_retries: int = Field(default=2, ge=0, le=5)
+    test_timeout_seconds: int = Field(default=120, ge=1, le=600)
+    max_edit_file_chars: int = 60000
+    workspace_min_free_mb: int = 100
+    git_author_name: str = "SDLC Agent"
+    git_author_email: str = "sdlc-agent@users.noreply.github.com"
+    jira_approval_account_ids: list[str] = []
+    jira_bot_account_id: str = ""
 
     # --- Webhook secrets (R-37, §5b) ---
     # Shared secrets to verify inbound webhooks are genuine (Phase 5.5).

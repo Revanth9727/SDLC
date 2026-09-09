@@ -852,6 +852,46 @@ refused with a comment and nothing happens.
 UI button or a permission-checked Jira comment, both driving the same resume, with noise
 and unauthorised replies safely ignored.
 
+## 5.5.4 Rich comment monitoring (classify + route intent)
+
+**PROMPT**
+```
+Extend the Jira comment_created webhook to READ and classify ALL human comments, not
+just APPROVE/REJECT. Per ai_rules.md R-44.
+Classify each human comment's intent (one cheap LLM call, MODEL_CHEAP):
+  - COMMAND (stop / redo differently / also do X): turn it into a PROPOSAL and route
+    it through the normal human gate + approval — NEVER auto-act (R-30). A comment
+    requests; it does not override.
+  - QUESTION (why this repo? what's the status?): answer it with a comment back,
+    reading only that ticket's own state.
+  - CHATTER (discussion, thanks, looks good): ignore.
+GUARDRAILS (all required):
+  - Only ACT on comments from AUTHORISED users (permission check, reuse R-38's check).
+  - NEVER treat the tool's OWN comments as instructions — filter out comments whose
+    author is the tool/bot account (prevents self-triggering loops).
+  - If intent is AMBIGUOUS, post a clarifying question instead of acting (R-10).
+  - Idempotent: process each comment delivery once.
+Emit an event per classified comment (intent + action taken). End by telling me how
+to: comment a command and see it become a gated proposal, comment a question and get
+an answer, and confirm the tool ignores its own comments and unauthorised users.
+```
+
+**SEE** — comment "also handle the divide function" → it appears as a new gated
+proposal (not auto-done). Comment "why did you pick this repo?" → the tool replies.
+Comment "thanks!" → ignored. The tool never reacts to its own comments.
+
+**TEST**
+- As an authorised user, comment a COMMAND → confirm it becomes a proposal at the gate,
+  not an immediate change.
+- Comment a QUESTION → confirm the tool answers.
+- Comment CHATTER → confirm ignored.
+- Comment as an unauthorised user → confirm not acted on.
+- Confirm the tool's own step-narration comments don't trigger it.
+
+**Phase 5.5 (full) done when:** the tool reads human comments, routes commands through
+the gate (never auto-acting), answers questions, ignores chatter and its own comments,
+and only acts on authorised users.
+
 ---
 
 # PHASE 6 — Guards, Failure Exits, Retry Caps

@@ -3,175 +3,543 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>{{ ticket.external_key or ticket.id }} — Agentic SDLC</title>
+  <title>{{ ticket.external_key or ticket.id }} - Agentic SDLC</title>
   <link rel="stylesheet" href="/static/style.css" />
 </head>
 <body>
-  <main>
-    <a href="/" class="back-link">← All tickets</a>
+  <main class="ticket-page">
+    <a href="/" class="back-link">&larr; All tickets</a>
 
-    <section class="card">
-      <h1>{{ ticket.title }}</h1>
-      <div class="ticket-meta">
-        {% if ticket.external_key %}
-        <span><strong>Jira key</strong> {{ ticket.external_key }}</span>
-        {% endif %}
-        <span><strong>Status</strong>
-          <span class="badge badge--{{ ticket.status }}">{{ ticket.status }}</span>
-        </span>
-        <span><strong>Claimed</strong>
-          {% if ticket.claimed_at %}{{ ticket.claimed_at.strftime('%Y-%m-%d %H:%M UTC') }}{% else %}no{% endif %}
-        </span>
-        {% if ticket.repos %}
-        <span><strong>Repos</strong> {{ ticket.repos | join(', ') }}</span>
-        {% endif %}
-        <span><strong>ID</strong> <code>{{ ticket.id }}</code></span>
+    <header class="ticket-header">
+      <div><div class="ticket-kicker">{{ ticket.external_key or 'Manual ticket' }}</div><h1>{{ ticket.title }}</h1></div>
+      <span id="ticket-status" class="badge badge--{{ ticket.status }}">{{ ticket.status }}</span>
+    </header>
+
+    <section class="ticket-overview">
+      <dl class="ticket-facts">
+        <div><dt>Claimed</dt><dd>{% if ticket.claimed_at %}{{ ticket.claimed_at.strftime('%Y-%m-%d %H:%M UTC') }}{% else %}No{% endif %}</dd></div>
+        <div><dt>Repository</dt><dd>{% if ticket.repos %}{{ ticket.repos | join(', ') }}{% else %}Not resolved{% endif %}</dd></div>
+        <div><dt>Ticket ID</dt><dd><code>{{ ticket.id }}</code></dd></div>
+      </dl>
+      {% if ticket.description %}<div class="description-box">{{ ticket.description }}</div>{% endif %}
+      <div class="action-row">
+        <button type="button" class="{{ 'link-button' if ticket.repos else 'secondary-button' }}" id="repo-action">
+          {{ 'Change repo' if ticket.repos else 'Resolve repos' }}
+        </button>
       </div>
-
-      {% if ticket.description %}
-      <div class="description-box">{{ ticket.description }}</div>
-      {% endif %}
-
-      <button type="button" id="diagnose-btn">Run diagnosis</button>
-      <span id="diagnose-status" style="margin-left:0.75rem;font-size:0.85rem;color:#666;"></span>
     </section>
 
-    {% if ticket.external_key and ticket.repos %}
-    <section class="card">
-      <h2>Private repo access</h2>
+    <section id="repo-panel" class="workflow-section" hidden>
+      <div class="section-heading"><h2>Repository</h2><button type="button" class="icon-close" id="repo-close" aria-label="Close repository panel">&times;</button></div>
+      <div id="repo-body" aria-live="polite"></div>
+    </section>
+
+    {% if ticket.repos %}
+    <section class="workflow-section">
+      <h2>Private access</h2>
       {% for repo in ticket.repos %}
       <div class="repo-choice">
         <code>{{ repo }}</code>
-        <input class="repo-token" data-repo="{{ repo }}" type="password" autocomplete="off" placeholder="Token for private access" />
-        <button type="button" onclick="saveRepoToken('{{ repo }}')">Save token</button>
+        <input class="repo-token" data-repo="{{ repo }}" type="password" autocomplete="off" placeholder="Private token" aria-label="Private token for {{ repo }}" />
+        <button type="button" class="secondary-button" onclick='saveRepoToken({{ repo|tojson }})'>Save token</button>
       </div>
       {% endfor %}
-      <p id="token-status" style="margin-top:0.5rem;font-size:0.85rem;color:#666;"></p>
+      <p id="token-status" class="inline-status" role="status"></p>
     </section>
     {% endif %}
 
-    <section class="card">
-      <h2>
-        Live activity
-        <span id="feed-status" style="font-size:0.75rem;font-weight:400;color:#94a3b8;margin-left:0.5rem">connecting…</span>
-      </h2>
-
-      <div id="activity-feed">
-        <div id="feed-empty">No events yet — waiting for activity on this ticket.</div>
+    <section class="workflow-section">
+      <div class="section-heading">
+        <h2>Current run</h2>
+        <button type="button" id="diagnose-btn" class="primary-button" hidden>Run diagnosis &amp; plan</button>
       </div>
+      <p id="diagnose-status" class="inline-status" role="status"></p>
+      <div id="active-summary" class="run-summary empty-state">Loading run state...</div>
+      <div id="failure-panel" class="failure-panel" hidden>
+        <strong>Needs attention</strong><p id="failure-reason"></p>
+        <button type="button" id="retry-btn" class="primary-button">Retry</button>
+      </div>
+    </section>
+
+    <section id="diagnosis-panel" class="workflow-section" hidden>
+      <h2>Diagnosis</h2>
+      <p id="root-cause" class="root-cause"></p>
+      <div><span class="field-label">Files</span><div id="diagnosis-files" class="file-list"></div></div>
+      <p id="diagnosis-reasoning" class="supporting-text"></p>
+    </section>
+
+    <section id="plan-panel" class="workflow-section" hidden>
+      <div class="section-heading"><h2>Plan</h2><span id="gate-badge" class="badge badge--awaiting_approval" hidden>Awaiting approval</span></div>
+      <ol id="plan-list" class="plan-list"></ol>
+      <p id="plan-reasoning" class="supporting-text"></p>
+      <div id="approval-controls" hidden>
+        <label for="decision-note">Decision note</label>
+        <textarea id="decision-note" maxlength="4000" placeholder="Required when rejecting"></textarea>
+        <div class="action-row">
+          <button type="button" id="approve-btn" class="primary-button">Approve</button>
+          <button type="button" id="reject-btn" class="danger-button">Reject</button>
+        </div>
+        <p id="approval-status" class="inline-status" role="status"></p>
+      </div>
+    </section>
+
+    <section id="execution-panel" class="workflow-section" hidden>
+      <h2>Execution and pull request</h2>
+      <div id="execution-results"></div>
+    </section>
+    <section id="proposals-panel" class="workflow-section" hidden>
+      <h2>Requested changes awaiting approval</h2>
+      <div id="command-proposals"></div>
+    </section>
+    <section class="workflow-section">
+      <h2>Previous attempts</h2>
+      <div id="attempt-history" class="attempt-history"><p class="empty-state">No previous attempts.</p></div>
+    </section>
+
+    <section class="workflow-section">
+      <div class="section-heading"><h2>Live activity</h2><span id="feed-status" class="connection-status">Connecting...</span></div>
+      <div id="activity-feed"><div id="feed-empty">No events yet.</div></div>
     </section>
   </main>
 
   <script>
-    const TICKET_ID = "{{ ticket.id }}";
-    const feed = document.getElementById('activity-feed');
-    const feedStatus = document.getElementById('feed-status');
-    const diagnoseBtn = document.getElementById('diagnose-btn');
-    const diagnoseStatus = document.getElementById('diagnose-status');
-    const tokenStatus = document.getElementById('token-status');
+    const TICKET_ID = {{ (ticket.id|string)|tojson }};
+    const HAS_REPO = {{ 'true' if ticket.repos else 'false' }};
+    const INITIAL_STATUS = {{ ticket.status|tojson }};
+    const ACTIVE_STATUSES = new Set(['running', 'waiting', 'pending']);
+    let currentGate = null;
     let emptyEl = document.getElementById('feed-empty');
+    const byId = id => document.getElementById(id);
+    const textNode = (tag, text, className = '') => {
+      const node = document.createElement(tag);
+      node.textContent = text;
+      if (className) node.className = className;
+      return node;
+    };
 
-    function fmtTime(isoStr) {
-      try {
-        return new Date(isoStr).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit', second:'2-digit'});
-      } catch { return isoStr || ''; }
+    function errorMessage(data, fallback) {
+      return typeof data?.detail === 'string' ? data.detail : (data?.error || fallback);
     }
 
-    function makeRow(ev) {
-      const agent = (ev.agent || 'system').toLowerCase();
-      const row = document.createElement('div');
-      row.className = `ev-row ev--${agent}`;
-      row.innerHTML =
-        `<span class="ev-agent">${ev.agent || '—'}</span>` +
-        `<span class="ev-stage">${ev.stage || '—'}</span>` +
-        `<span class="ev-msg">${ev.message || ''}</span>` +
-        `<span class="ev-ts">${fmtTime(ev.ts)}</span>`;
+    async function loadSubtasks() {
+      const response = await fetch(`/tickets/${TICKET_ID}/subtasks`);
+      const rows = await response.json();
+      if (!response.ok) throw new Error(errorMessage(rows, 'Could not load run state'));
+      renderWorkflow(rows);
+      await loadProposals();
+    }
+
+    function renderWorkflow(rows) {
+      const newest = [...rows].reverse();
+      const active = newest.find(row => ACTIVE_STATUSES.has(row.status));
+      const latest = newest[0];
+      const display = active || latest;
+      renderActive(active);
+      renderDiagnosis(display?.state?.diagnosis);
+      renderPlan(display, active?.waiting ? active : null);
+      renderFailure(latest, active);
+      renderExecution(display);
+      renderHistory(rows, active?.subtask_id);
+
+      const status = active?.waiting ? 'awaiting_approval' : (active?.status || latest?.status || INITIAL_STATUS);
+      const badge = byId('ticket-status');
+      badge.textContent = status;
+      badge.className = `badge badge--${status}`;
+      const freshPending = active?.status === 'pending' && !active.state;
+      const canStart = HAS_REPO && (!active || freshPending) && !['needs_human', 'failed', 'in_review', 'done'].includes(latest?.status);
+      byId('diagnose-btn').hidden = !canStart;
+      byId('diagnose-btn').disabled = false;
+    }
+
+    function renderActive(active) {
+      const target = byId('active-summary');
+      target.replaceChildren();
+      if (!active) {
+        target.className = 'run-summary empty-state';
+        target.textContent = 'No active subtask.';
+        return;
+      }
+      if (active.resumable) {
+        const button = textNode('button', 'Resume approved run', 'primary-button');
+        button.onclick = async () => {
+          button.disabled = true;
+          try {
+            const response = await fetch(`/tickets/${TICKET_ID}/subtasks/${active.subtask_id}/approve`, {
+              method: 'POST', headers: {'Content-Type': 'application/json'},
+              body: JSON.stringify({note: active.state?.approval_note || ''})
+            });
+            const data = await response.json();
+            if (!response.ok) throw new Error(errorMessage(data, 'Resume failed'));
+            await loadSubtasks();
+          } catch (error) {
+            byId('diagnose-status').textContent = error.message;
+            button.disabled = false;
+          }
+        };
+        target.appendChild(button);
+      }
+      const budget = active.state?.budget_used || {};
+      target.className = 'run-summary';
+      [
+        ['Status', active.waiting ? 'waiting for approval' : active.status],
+        ['Subtask', active.subtask_id],
+        ['Model calls', String(budget.calls || 0)],
+        ['Tokens', Number(budget.tokens || 0).toLocaleString()],
+        ['Estimated cost', `$${Number(budget.est_cost_usd || 0).toFixed(4)}`]
+      ].forEach(([label, value]) => {
+        const item = document.createElement('div');
+        item.append(textNode('span', label, 'field-label'), textNode('strong', value));
+        target.appendChild(item);
+      });
+    }
+
+    function renderDiagnosis(diagnosis) {
+      const panel = byId('diagnosis-panel');
+      panel.hidden = !diagnosis;
+      if (!diagnosis) return;
+      byId('root-cause').textContent = diagnosis.root_cause || 'No root cause found';
+      byId('diagnosis-reasoning').textContent = diagnosis.reasoning || '';
+      const files = byId('diagnosis-files');
+      files.replaceChildren();
+      (diagnosis.files || []).forEach(file => files.appendChild(textNode('code', file)));
+      if (!files.children.length) files.appendChild(textNode('span', 'None recorded', 'empty-state'));
+    }
+
+    function renderPlan(planRow, gateRow) {
+      const state = planRow?.state || {};
+      const panel = byId('plan-panel');
+      panel.hidden = !state.plan?.length;
+      currentGate = gateRow?.waiting ? gateRow : null;
+      if (panel.hidden) return;
+      const list = byId('plan-list');
+      list.replaceChildren();
+      state.plan.forEach(step => {
+        const item = document.createElement('li');
+        item.append(textNode('strong', step.intent), textNode('code', step.target_file));
+        list.appendChild(item);
+      });
+      byId('plan-reasoning').textContent = state.plan_reasoning || '';
+      byId('gate-badge').hidden = !currentGate;
+      byId('approval-controls').hidden = !currentGate;
+    }
+
+    function renderFailure(latest, active) {
+      const state = latest?.state || {};
+      const failed = ['needs_human', 'failed'].includes(latest?.status) || ['needs_human', 'failed'].includes(state.status);
+      byId('failure-panel').hidden = !failed;
+      if (!failed) return;
+      byId('failure-reason').textContent = state.failure_reason || 'The run needs human input.';
+      byId('retry-btn').hidden = Boolean(active) || !HAS_REPO;
+    }
+
+    function renderHistory(rows, activeId) {
+      const target = byId('attempt-history');
+      target.replaceChildren();
+      const previous = rows.filter(row => row.subtask_id !== activeId).reverse();
+      if (!previous.length) {
+        target.appendChild(textNode('p', 'No previous attempts.', 'empty-state'));
+        return;
+      }
+      previous.forEach(row => {
+        const state = row.state || {};
+        const item = document.createElement('article');
+        item.className = 'attempt-row';
+        const heading = document.createElement('div');
+        heading.className = 'attempt-heading';
+        heading.append(textNode('code', row.subtask_id), textNode('span', row.status, `badge badge--${row.status}`));
+        item.appendChild(heading);
+        if (state.diagnosis?.root_cause) item.appendChild(textNode('p', `Diagnosis: ${state.diagnosis.root_cause}`));
+        if (state.plan?.length) item.appendChild(textNode('p', `Plan: ${state.plan.length} step(s); ${state.steps_done?.length || 0} completed`));
+        if (state.failure_reason) item.appendChild(textNode('p', state.failure_reason, 'failure-text'));
+        target.appendChild(item);
+      });
+    }
+
+    const TEST_OUTCOME_LABEL = {
+      passed: 'pytest passed',
+      failed: 'pytest failed',
+      no_tests_collected: 'no tests collected (not a failure)',
+      timed_out: 'pytest timed out',
+    };
+
+    function renderExecution(row) {
+      const state = row?.state;
+      const target = byId('execution-results');
+      target.replaceChildren();
+      byId('execution-panel').hidden = !(state?.steps_done?.length || state?.pr_url);
+      if (state?.verifiability === 'no_tests') {
+        target.appendChild(textNode('p', 'Unverifiable — this repo has no tests and none were added.', 'badge badge--no_tests'));
+      }
+      for (const step of state?.steps_done || []) {
+        const detail = document.createElement('details');
+        const outcome = TEST_OUTCOME_LABEL[step.tests?.outcome] || step.tests?.outcome || 'unknown';
+        detail.appendChild(textNode('summary', `${step.step_id}: ${step.intent} (${step.target_file}) — ${outcome}`));
+        detail.appendChild(textNode('pre', step.tests?.output || ''));
+        target.appendChild(detail);
+      }
+      if (state?.pr_url) {
+        const link = textNode('a', 'Open pull request');
+        const url = new URL(state.pr_url);
+        if (url.protocol === 'https:' && url.hostname === 'github.com') {
+          link.href = url.href; link.target = '_blank'; link.rel = 'noopener noreferrer';
+          target.appendChild(link);
+        }
+        target.appendChild(renderCiStatus(row.subtask_id));
+      }
+    }
+
+    // Local pytest result is shown per-step above; this is the OTHER, authoritative
+    // check — the PR's real CI run — fetched on demand (never assumed configured).
+    function renderCiStatus(subtaskId) {
+      const wrap = document.createElement('div');
+      wrap.className = 'ci-status';
+      const status = textNode('span', 'CI: not checked', 'badge');
+      const button = textNode('button', 'Check CI status', 'secondary-button');
+      button.type = 'button';
+      button.onclick = async () => {
+        button.disabled = true;
+        status.className = 'badge';
+        status.textContent = 'CI: checking…';
+        status.onclick = null;
+        status.style.cursor = '';
+        try {
+          const response = await fetch(`/tickets/${TICKET_ID}/subtasks/${subtaskId}/ci-status`);
+          const data = await response.json();
+          if (!response.ok) throw new Error(errorMessage(data, 'Could not load CI status'));
+          if (!data.configured) {
+            status.textContent = 'CI: not configured for this repo';
+          } else {
+            const label = data.status !== 'completed' ? 'running' : (data.conclusion === 'success' ? 'passed' : 'failed');
+            const badgeStatus = {running: 'processing', passed: 'done', failed: 'needs_human'}[label];
+            status.textContent = `CI: ${label}`;
+            status.className = `badge badge--${badgeStatus}`;
+            if (data.url) {
+              status.style.cursor = 'pointer';
+              status.title = 'Open CI run';
+              status.onclick = () => window.open(data.url, '_blank', 'noopener,noreferrer');
+            }
+          }
+        } catch (error) {
+          status.textContent = error.message;
+        } finally {
+          button.disabled = false;
+        }
+      };
+      wrap.append(status, button);
+      return wrap;
+    }
+
+    async function loadProposals() {
+      const response = await fetch(`/tickets/${TICKET_ID}/approvals`);
+      if (!response.ok) return;
+      const rows = (await response.json()).filter(row => row.proposed_action.kind === 'command');
+      byId('proposals-panel').hidden = !rows.length;
+      const target = byId('command-proposals');
+      // Avoid replacing a note while the operator is typing.
+      if (target.contains(document.activeElement)) return;
+      target.replaceChildren();
+      for (const row of rows) {
+        const article = document.createElement('article');
+        article.appendChild(textNode('p', row.proposed_action.description));
+        const note = document.createElement('textarea');
+        note.placeholder = 'Note (required to reject)';
+        note.setAttribute('aria-label', 'Proposal decision note');
+        article.appendChild(note);
+        const status = textNode('p', '', 'inline-status');
+        for (const action of ['approve', 'reject']) {
+          const button = textNode('button', action === 'approve' ? 'Approve proposal' : 'Reject proposal', 'secondary-button');
+          button.onclick = async () => {
+            if (action === 'reject' && !note.value.trim()) { status.textContent = 'Enter a rejection note'; return; }
+            article.querySelectorAll('button').forEach(b => b.disabled = true);
+            try {
+              const res = await fetch(`/tickets/${TICKET_ID}/approvals/${row.id}/${action}`, {
+                method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({note: note.value.trim()})
+              });
+              const data = await res.json();
+              if (!res.ok) throw new Error(errorMessage(data, 'Proposal decision failed'));
+              await loadSubtasks();
+            } catch (error) {
+              status.textContent = error.message;
+              article.querySelectorAll('button').forEach(b => b.disabled = false);
+            }
+          };
+          article.appendChild(button);
+        }
+        article.appendChild(status);
+        target.appendChild(article);
+      }
+    }
+
+    async function runDiagnosis() {
+      byId('diagnose-btn').disabled = true;
+      byId('retry-btn').disabled = true;
+      byId('diagnose-status').textContent = 'Running diagnosis and planning...';
+      try {
+        const response = await fetch(`/tickets/${TICKET_ID}/diagnose`, {method: 'POST'});
+        const data = await response.json();
+        if (!response.ok) throw new Error(errorMessage(data, 'Workflow failed'));
+        byId('diagnose-status').textContent = data.approval_status === 'pending' ? 'Plan ready for approval.' : data.status;
+      } catch (error) {
+        byId('diagnose-status').textContent = error.message;
+      } finally {
+        byId('retry-btn').disabled = false;
+        await loadSubtasks();
+      }
+    }
+
+    async function decide(action) {
+      if (!currentGate) return;
+      const note = byId('decision-note').value.trim();
+      if (action === 'reject' && !note) {
+        byId('approval-status').textContent = 'Enter a rejection note.';
+        byId('decision-note').focus();
+        return;
+      }
+      byId('approve-btn').disabled = true;
+      byId('reject-btn').disabled = true;
+      byId('approval-status').textContent = 'Saving decision...';
+      try {
+        const response = await fetch(`/tickets/${TICKET_ID}/subtasks/${currentGate.subtask_id}/${action}`, {
+          method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({note})
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(errorMessage(data, 'Decision failed'));
+        byId('approval-status').textContent = action === 'approve' ? 'Approved. Flow resumed.' : 'Rejected. Human input requested.';
+        await loadSubtasks();
+      } catch (error) {
+        byId('approval-status').textContent = error.message;
+        byId('approve-btn').disabled = false;
+        byId('reject-btn').disabled = false;
+      }
+    }
+
+    function openRepoResolver() {
+      byId('repo-panel').hidden = false;
+      byId('repo-body').textContent = 'Resolving repositories...';
+      fetch(`/tickets/${TICKET_ID}/resolve-repos`, {method: 'POST'})
+        .then(async response => {
+          const data = await response.json();
+          if (!data.source) throw new Error(errorMessage(data, 'Repository resolution failed'));
+          return data;
+        })
+        .then(renderRepoResolver)
+        .catch(error => { byId('repo-body').textContent = error.message; });
+    }
+
+    function renderRepoResolver(data) {
+      const body = byId('repo-body');
+      body.replaceChildren();
+      const candidates = data.candidates || [];
+      candidates.forEach(repo => body.appendChild(repoInput(repo)));
+      if (candidates.length) {
+        const confirm = textNode('button', 'Confirm selected', 'primary-button');
+        confirm.type = 'button';
+        confirm.onclick = confirmSelectedRepos;
+        body.appendChild(confirm);
+      }
+      const paste = document.createElement('div');
+      paste.className = 'paste-repo';
+      const url = document.createElement('input');
+      url.id = 'paste-url'; url.type = 'text'; url.placeholder = 'https://github.com/owner/repo'; url.setAttribute('aria-label', 'GitHub repository URL');
+      const token = document.createElement('input');
+      token.id = 'paste-token'; token.type = 'password'; token.placeholder = 'Private token'; token.autocomplete = 'off'; token.setAttribute('aria-label', 'Private repository token');
+      const button = textNode('button', candidates.length ? 'Use another repo' : 'Confirm repo', 'secondary-button');
+      button.type = 'button'; button.onclick = confirmPastedRepo;
+      paste.append(url, token, button);
+      body.append(paste, textNode('p', data.error || '', 'inline-status'));
+    }
+
+    function repoInput(repo) {
+      const row = document.createElement('div'); row.className = 'repo-choice';
+      const label = document.createElement('label');
+      const checkbox = document.createElement('input'); checkbox.type = 'checkbox'; checkbox.name = 'repo'; checkbox.value = repo; checkbox.checked = true;
+      label.append(checkbox, textNode('code', repo));
+      const token = document.createElement('input'); token.type = 'password'; token.className = 'candidate-token'; token.dataset.repo = repo; token.placeholder = 'Private token'; token.autocomplete = 'off';
+      row.append(label, token);
       return row;
     }
 
-    function appendEvent(ev) {
-      if (emptyEl) { emptyEl.remove(); emptyEl = null; }
-      feed.appendChild(makeRow(ev));
-      feed.scrollTop = feed.scrollHeight;
+    async function confirmSelectedRepos() {
+      const selected = [...document.querySelectorAll('#repo-body input[name=repo]:checked')].map(input => input.value);
+      if (!selected.length) return;
+      const tokens = {};
+      selected.forEach(repo => {
+        const value = document.querySelector(`.candidate-token[data-repo="${CSS.escape(repo)}"]`)?.value.trim();
+        if (value) tokens[repo] = value;
+      });
+      await confirmRepos(selected, tokens);
     }
 
-    function insertDivider(label) {
-      const d = document.createElement('div');
-      d.style.cssText = 'text-align:center;color:#94a3b8;font-size:0.72rem;padding:4px 0;font-family:system-ui;letter-spacing:.05em;';
-      d.textContent = label;
-      feed.appendChild(d);
-    }
-
-    // ── 1. Open SSE first so the queue is subscribed before we fetch history.
-    //        This eliminates the race where an event arrives between history
-    //        fetch and SSE connection and gets missed.
-    const es = new EventSource(`/stream/${TICKET_ID}`);
-    let historyLoaded = false;
-
-    es.onopen = () => {
-      feedStatus.textContent = 'connected';
-      feedStatus.style.color = '#22c55e';
-
-      // ── 2. Fetch history now that we're subscribed.
-      if (historyLoaded) return;
-      historyLoaded = true;
-      fetch(`/tickets/${TICKET_ID}/events`)
-        .then(r => r.json())
-        .then(evts => {
-          if (evts.length === 0) return;
-          if (emptyEl) { emptyEl.remove(); emptyEl = null; }
-          evts.forEach(ev => feed.appendChild(makeRow(ev)));
-          insertDivider('─── live ───');
-          feed.scrollTop = feed.scrollHeight;
-        })
-        .catch(() => {});
-    };
-
-    // ── 3. Live events arrive here after the divider.
-    es.onmessage = (e) => {
-      try { appendEvent(JSON.parse(e.data)); } catch {}
-    };
-
-    es.onerror = () => {
-      feedStatus.textContent = 'reconnecting…';
-      feedStatus.style.color = '#f59e0b';
-    };
-
-    diagnoseBtn.addEventListener('click', async () => {
-      diagnoseBtn.disabled = true;
-      diagnoseStatus.textContent = 'running…';
-      try {
-        const res = await fetch(`/tickets/${TICKET_ID}/diagnose`, {method: 'POST'});
-        const data = await res.json();
-        diagnoseStatus.textContent = data.status || data.error || 'done';
-        if (data.code === 'private_repo_token_required') {
-          diagnoseStatus.textContent = 'this repo is private — enter a token to access it';
-        }
-      } catch {
-        diagnoseStatus.textContent = 'error — see server logs';
-      } finally {
-        diagnoseBtn.disabled = false;
+    async function confirmPastedRepo() {
+      const value = byId('paste-url').value.trim();
+      const match = value.match(/github\.com\/([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)/);
+      if (!match) {
+        byId('repo-body').appendChild(textNode('p', 'Enter a valid github.com/owner/repo URL.', 'failure-text'));
+        return;
       }
-    });
+      const token = byId('paste-token').value.trim();
+      await confirmRepos([match[1]], token ? {[match[1]]: token} : {});
+    }
+
+    async function confirmRepos(repos, repo_tokens = {}) {
+      const response = await fetch(`/tickets/${TICKET_ID}/confirm-repos`, {
+        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({repos, repo_tokens})
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        renderRepoResolver({...data, candidates: data.private_repos || repos});
+        return;
+      }
+      location.reload();
+    }
 
     async function saveRepoToken(repo) {
       const input = document.querySelector(`.repo-token[data-repo="${CSS.escape(repo)}"]`);
       const token = input?.value.trim();
-      if (!token) { alert('Enter a token first'); return; }
-      tokenStatus.textContent = 'Saving…';
-      const res = await fetch(`/ticket/{{ ticket.external_key }}/confirm-repos`, {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({repos: [repo], repo_tokens: {[repo]: token}})
+      if (!token) return;
+      const response = await fetch(`/tickets/${TICKET_ID}/confirm-repos`, {
+        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({repos: [repo], repo_tokens: {[repo]: token}})
       });
-      const data = await res.json();
-      if (data.saved) {
-        input.value = '';
-        tokenStatus.textContent = 'Token saved. It will not be shown again.';
-      } else {
-        tokenStatus.textContent = data.error || 'Could not save token';
-      }
+      const data = await response.json();
+      input.value = '';
+      byId('token-status').textContent = response.ok ? 'Token saved.' : errorMessage(data, 'Could not save token');
     }
+
+    function fmtTime(iso) { return iso ? new Date(iso).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit', second: '2-digit'}) : ''; }
+    function makeEventRow(event) {
+      const row = document.createElement('div');
+      row.className = `ev-row ev--${(event.agent || 'system').toLowerCase()}`;
+      [['ev-agent', event.agent || 'system'], ['ev-stage', event.stage || ''], ['ev-msg', event.message || ''], ['ev-ts', fmtTime(event.ts)]]
+        .forEach(([name, value]) => row.appendChild(textNode('span', value, name)));
+      return row;
+    }
+    function appendEvent(event) {
+      if (emptyEl) { emptyEl.remove(); emptyEl = null; }
+      byId('activity-feed').appendChild(makeEventRow(event));
+    }
+
+    const stream = new EventSource(`/stream/${TICKET_ID}`);
+    let historyLoaded = false;
+    stream.onopen = async () => {
+      byId('feed-status').textContent = 'Connected';
+      if (historyLoaded) return;
+      historyLoaded = true;
+      const response = await fetch(`/tickets/${TICKET_ID}/events`);
+      if (response.ok) (await response.json()).forEach(appendEvent);
+    };
+    stream.onmessage = event => {
+      appendEvent(JSON.parse(event.data));
+      loadSubtasks().catch(() => {});
+    };
+    stream.onerror = () => { byId('feed-status').textContent = 'Reconnecting...'; };
+
+    byId('diagnose-btn').addEventListener('click', runDiagnosis);
+    byId('retry-btn').addEventListener('click', runDiagnosis);
+    byId('approve-btn').addEventListener('click', () => decide('approve'));
+    byId('reject-btn').addEventListener('click', () => decide('reject'));
+    byId('repo-action').addEventListener('click', openRepoResolver);
+    byId('repo-close').addEventListener('click', () => { byId('repo-panel').hidden = true; });
+    loadSubtasks().catch(error => { byId('active-summary').textContent = error.message; });
   </script>
 </body>
 </html>

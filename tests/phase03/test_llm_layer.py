@@ -89,6 +89,28 @@ def test_complete_json_retries_once_on_validation_error(monkeypatch) -> None:
     assert LLMClient.get_usage("ticket-2")["calls"] == 2
 
 
+def test_complete_json_strips_markdown_code_fence(monkeypatch) -> None:
+    # Some models wrap JSON in ```json ... ``` despite instructions not to; that
+    # used to raise a raw ValidationError ("Invalid JSON: expected value at line
+    # 1 column 1") instead of parsing. Also confirms JSON mode is requested.
+    monkeypatch.setattr(
+        llm,
+        "settings",
+        SimpleNamespace(openai_api_key="test", model_strong="gpt-4o", model_cheap="gpt-4o-mini"),
+    )
+    LLMClient.reset_usage()
+    fenced = '```json\n{\n  "word": "pong"\n}\n```'
+    fake = _FakeOpenAI([fenced])
+    client = LLMClient(client=fake)
+
+    with client.use_ticket("ticket-3"):
+        result = client.complete_json("Reply in JSON.", "ping", _Ping, tier="strong")
+
+    assert result == _Ping(word="pong")
+    assert len(fake.chat.completions.calls) == 1  # parsed on the first attempt, no retry needed
+    assert fake.chat.completions.calls[0]["response_format"] == {"type": "json_object"}
+
+
 def test_router_is_deterministic() -> None:
     assert model_tier("diagnosis") == "strong"
     assert model_tier("planner", ambiguous=True) == "strong"

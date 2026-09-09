@@ -32,6 +32,7 @@ from app.db.models import Ticket
 from app.events import log_event as ev_log
 from app.core.reconcile import reconcile
 from app.core.stuck import check_stuck
+from app.core.subtasks import prepare_subtask
 from app.tools.jira_tool import JiraTool
 
 logger = logging.getLogger(__name__)
@@ -79,7 +80,14 @@ async def start_loop(emit: Callable[[dict], Awaitable[None]]) -> asyncio.Task:
 # ---------------------------------------------------------------------------
 
 async def _do_poll(emit: Callable[[dict], Awaitable[None]]) -> list[dict]:
+    from app.core.webhook_processing import recover_deliveries
+    from app.core.pr_sync import reconcile_prs
+    await recover_deliveries()
     jira = JiraTool()
+    try:
+        await reconcile_prs(jira)
+    except Exception as exc:
+        logger.warning('PR reconciliation failed: %s', exc)
     jira.fetch_project_statuses(force_refresh=True)
 
     # Step 2: reconcile drift BEFORE claiming (R-28).
@@ -169,6 +177,18 @@ async def _claim_one(jira: JiraTool, issue: dict) -> dict | None:
 
     logger.info("poller: CLAIMED %r ticket_id=%s", key, ticket_id)
 
+    replacement = prepare_subtask(
+        ticket_id,
+        description=issue["description"],
+        jira=jira,
+    )
+    for item in replacement.superseded:
+        logger.info(
+            "poller: superseded old subtask=%s ticket=%r",
+            item["subtask_id"],
+            key,
+        )
+
     # Persist + publish so the event survives a page reload (R-7).
     await ev_log(
         ticket_id=ticket_id,
@@ -190,5 +210,6 @@ async def _claim_one(jira: JiraTool, issue: dict) -> dict | None:
         "key": key,
         "title": issue["summary"],
         "ticket_id": ticket_id,
+        "subtask_id": replacement.subtask_id,
         "claimed_at": now.isoformat(),
     }

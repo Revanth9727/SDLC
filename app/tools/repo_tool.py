@@ -213,8 +213,9 @@ class RepoTool:
 
     @staticmethod
     def _validate_full_name(full_name: str) -> None:
+        import re
         parts = full_name.split("/")
-        if len(parts) != 2 or not all(parts):
+        if len(parts) != 2 or any(not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", p) for p in parts):
             raise ValueError("repo full_name must be 'owner/repo'")
 
     @staticmethod
@@ -224,3 +225,85 @@ class RepoTool:
         if "/" in subtask_id or "\\" in subtask_id or subtask_id in {".", ".."}:
             raise ValueError("subtask_id must be a simple directory name")
         return subtask_id
+
+    def revision(self, full_name: str, subtask_id: str) -> str:
+        checkout = self._checkout_path(full_name, self._workspace_id(subtask_id))
+        return self._git(["rev-parse", "HEAD"], cwd=checkout).stdout.strip()
+
+    def prepare_execution(self, full_name: str, subtask_id: str, base_commit: str,
+                          changes: dict[str, str]) -> Path:
+        """Rebuild only this disposable workspace from its checkpoint artifacts."""
+        if not base_commit:
+            raise ValueError("No diagnosis revision recorded; run diagnosis again before editing")
+        self.workspace_root.mkdir(parents=True, exist_ok=True)
+        if shutil.disk_usage(self.workspace_root).free < settings.workspace_min_free_mb * 1024 * 1024:
+            raise RuntimeError("Insufficient workspace disk space")
+        self.cleanup_workspace(subtask_id)
+        checkout = self.clone_or_pull(full_name, subtask_id)
+        if self.revision(full_name, subtask_id) != base_commit:
+            raise ValueError("Repository changed since diagnosis; a fresh plan and approval are required")
+        self._git(["checkout", "-b", self.branch_name(subtask_id)], cwd=checkout)
+        for path, content in changes.items():
+            if content is None:
+                self.delete_execution_file(checkout, path)
+            else:
+                self.write_execution_file(checkout, path, content)
+        return checkout
+
+    @staticmethod
+    def branch_name(subtask_id: str) -> str:
+        import uuid
+        return f"sdlc/{uuid.UUID(subtask_id)}"
+
+    def execution_file(self, checkout: Path, path: str) -> Path:
+        from app.agents.planning import Step
+        Step(step_id="path", intent="validate", target_file=path)
+        if any(part in {'.git', '.env'} for part in Path(path).parts):
+            raise ValueError("Editing git metadata or secrets is forbidden")
+        candidate = self._safe_path(checkout, path)
+        probe = checkout / path
+        while probe != checkout:
+            if probe.is_symlink():
+                raise ValueError("Editing symlinks is not supported")
+            probe = probe.parent
+        return candidate
+
+    def write_execution_file(self, checkout: Path, path: str, content: str) -> None:
+        target = self.execution_file(checkout, path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding='utf-8')
+
+    def delete_execution_file(self, checkout: Path, path: str) -> None:
+        target = self.execution_file(checkout, path)
+        if target.exists():
+            target.unlink()
+
+    def push_changes(self, full_name: str, subtask_id: str, base_commit: str,
+                     changes: dict[str, str]) -> str:
+        """Rebuild approved tested artifacts, commit only those paths, push a scoped branch."""
+        if not changes:
+            raise ValueError("No tested changes to publish")
+        checkout = self.prepare_execution(full_name, subtask_id, base_commit, changes)
+        branch = self.branch_name(subtask_id)
+        written = [path for path, content in changes.items() if content is not None]
+        deleted = [path for path, content in changes.items() if content is None]
+        if written:
+            self._git(["add", "--", *written], cwd=checkout)
+        if deleted:
+            self._git(["rm", "--ignore-unmatch", "--", *deleted], cwd=checkout)
+        self._git(["-c", f"user.name={settings.git_author_name}", "-c",
+                   f"user.email={settings.git_author_email}", "commit", "-m",
+                   f"Apply approved SDLC subtask {subtask_id}"], cwd=checkout)
+        token = self._stored_token(full_name) or settings.github_token
+        # A retry after a successful push verifies the existing tree; it never
+        # force-pushes or overwrites a branch someone else changed.
+        remote = self._git(["-c", self._auth_header(token), "ls-remote", "--heads", "origin", branch], cwd=checkout)
+        if remote.stdout.strip():
+            self._git(["-c", self._auth_header(token), "fetch", "--depth", "1", "origin", branch], cwd=checkout)
+            local_tree = self._git(["rev-parse", "HEAD^{tree}"], cwd=checkout).stdout.strip()
+            remote_tree = self._git(["rev-parse", "FETCH_HEAD^{tree}"], cwd=checkout).stdout.strip()
+            if local_tree != remote_tree:
+                raise ValueError("Existing subtask branch differs from the tested change; refusing to overwrite")
+        else:
+            self._git(["-c", self._auth_header(token), "push", "origin", f"HEAD:refs/heads/{branch}"], cwd=checkout)
+        return branch

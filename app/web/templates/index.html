@@ -45,14 +45,15 @@
             <td><a href="/tickets/{{ ticket.id }}" style="color:#6366f1;text-decoration:none;font-weight:500">{{ ticket.title }}</a></td>
             <td><span class="badge badge--{{ ticket.status }}">{{ ticket.status }}</span></td>
             <td>{% if ticket.claimed_at %}<span class="badge badge--processing">claimed</span>{% else %}—{% endif %}</td>
-            <td class="mono" style="font-size:0.8rem">
-              {% if ticket.repos %}{{ ticket.repos | join(', ') }}{% else %}—{% endif %}
-            </td>
-            <td>
-              {% if ticket.external_key and not ticket.repos %}
-              <button class="btn-small" onclick="startResolve('{{ ticket.external_key }}')">Resolve repos</button>
+            <td class="repo-cell">
+              {% if ticket.repos %}
+                {% for repo in ticket.repos %}<code>{{ repo }}</code>{% if not loop.last %}<br>{% endif %}{% endfor %}
+                <button class="link-button" type="button" onclick='startResolve({{ (ticket.id|string)|tojson }})'>Change repo</button>
+              {% else %}
+                <button class="btn-small" type="button" onclick='startResolve({{ (ticket.id|string)|tojson }})'>Resolve repos</button>
               {% endif %}
             </td>
+            <td><a class="row-action" href="/tickets/{{ ticket.id }}">Open</a></td>
           </tr>
           {% endfor %}
         </tbody>
@@ -88,16 +89,21 @@
       panel.style.display = '';
       panel.scrollIntoView({behavior: 'smooth'});
       document.getElementById('resolve-body').innerHTML = '<em>Resolving…</em>';
-      fetch(`/ticket/${key}/resolve-repos`, {method: 'POST'})
-        .then(r => r.json()).then(renderResolve)
-        .catch(() => { document.getElementById('resolve-body').innerHTML = '<span class="badge badge--needs_human">Error — see server logs</span>'; });
+      fetch(`/tickets/${key}/resolve-repos`, {method: 'POST'})
+        .then(async r => {
+          const data = await r.json();
+          if (!data.source) throw new Error(data.error || 'Repository resolution failed');
+          return data;
+        }).then(renderResolve)
+        .catch(error => { document.getElementById('resolve-body').textContent = error.message; });
     }
 
     function renderResolve(data) {
       const body = document.getElementById('resolve-body');
-      if (data.source === 'needs_paste') {
+      if (data.source === 'needs_paste' || !data.candidates?.length) {
         body.innerHTML = `
-          <p>No repos found automatically. Paste a GitHub repo URL:</p>
+          ${data.error ? `<p><span class="badge badge--needs_human">${data.error}</span></p>` : ''}
+          <p>Paste a GitHub repo URL:</p>
           <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap">
             <input id="paste-url" type="text" placeholder="https://github.com/owner/repo" style="width:22rem"/>
             <input id="paste-token" type="password" autocomplete="off" placeholder="Private token if needed" style="width:16rem"/>
@@ -149,7 +155,7 @@
     async function doConfirm(repos, repo_tokens = {}) {
       const msg = document.getElementById('confirm-msg');
       msg.textContent = 'Saving…';
-      const res = await fetch(`/ticket/${_resolveKey}/confirm-repos`, {
+      const res = await fetch(`/tickets/${_resolveKey}/confirm-repos`, {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({repos, repo_tokens})

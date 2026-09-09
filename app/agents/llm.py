@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections import defaultdict
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -67,15 +68,18 @@ class LLMClient:
         tier: ModelTier = "strong",
         *,
         ticket_id: str | None = None,
+        json_mode: bool = False,
     ) -> str:
         """Return plain text from OpenAI and record usage for the current ticket."""
         model = self._model_for_tier(tier)
+        kwargs: dict[str, Any] = {"response_format": {"type": "json_object"}} if json_mode else {}
         response = self._client.chat.completions.create(
             model=model,
             messages=[
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
+            **kwargs,
         )
         self._record_usage(self._resolve_ticket_id(ticket_id), model, response)
         return response.choices[0].message.content or ""
@@ -97,16 +101,28 @@ class LLMClient:
         last_error: ValidationError | ValueError | None = None
         prompt = user
         for attempt in range(2):
-            text = self.complete(json_system, prompt, tier=tier, ticket_id=ticket_id)
+            # json_mode asks the API to guarantee valid JSON (no markdown fences
+            # or prose); _strip_code_fence is a defensive second layer in case a
+            # model/provider ignores that or doesn't support it.
+            text = self.complete(json_system, prompt, tier=tier, ticket_id=ticket_id, json_mode=True)
             try:
-                return schema.model_validate_json(text)
+                return schema.model_validate_json(self._strip_code_fence(text))
             except (ValidationError, ValueError) as exc:
                 last_error = exc
                 prompt = (
                     f"{user}\n\nYour previous response did not validate as JSON for "
-                    f"{schema.__name__}: {exc}. Return corrected JSON only."
+                    f"{schema.__name__}: {exc}. Return corrected JSON only, no markdown "
+                    "code fences or commentary."
                 )
         raise last_error  # type: ignore[misc]
+
+    @staticmethod
+    def _strip_code_fence(text: str) -> str:
+        """Unwrap a ```json ... ``` (or bare ``` ... ```) fence some models add
+        despite instructions not to. A no-op on already-bare JSON."""
+        stripped = text.strip()
+        match = re.match(r"^```[a-zA-Z0-9]*\s*\n(.*)\n```\s*$", stripped, re.DOTALL)
+        return match.group(1).strip() if match else stripped
 
     @classmethod
     def get_usage(cls, ticket_id: str) -> dict[str, float | int]:

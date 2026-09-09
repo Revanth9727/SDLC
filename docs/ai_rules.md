@@ -215,12 +215,19 @@ an integration stage assembles the combined change across affected repos, runs t
 test suite, and checks for cross-breakage. Pass → PR(s). Cross-breakage → escalate to the
 human with what broke; never ship a change that passes per-sub-task but fails as a whole.
 
-**R-32. A fix that can't be verified is escalated, never assumed safe.**
-Before trusting a change, check verifiability: if the repo has no tests, flag "no tests
-exist to verify this" at the human gate (weak-confidence signal) and optionally have the
-Executor write a test for its own change; if the change adds uncovered code, the Critic
-surfaces it. An unverifiable change is escalated to the human explicitly — never silently
-treated as safe.
+**R-32. Verify every fix — always write a test, run locally AND let CI confirm on the PR.**
+The tool ALWAYS writes its own test covering the specific change it made — even if the repo
+already has tests — so the fix has a dedicated regression test. A written test must be
+COMPLETE and runnable: correct imports referencing the real code from its real module/path
+(R-46), meaningful assertions that exercise BOTH the failing case and the fixed behavior,
+and conform to the repo's test framework/location/conventions. Verification = the new test
+passes AND existing tests still pass. Run tests **locally** first (fast gate; catch obvious
+breaks before the PR), and when the repo has a **CI/CD pipeline**, let it run on the PR as
+the authoritative, environment-matched check (**both**: local for speed, CI as the real
+gate; if they disagree, CI wins). pytest exit codes: 0 = pass, 1 = real failure
+(retry/critic), 5 = none collected (shouldn't happen once the tool writes its own test).
+Only if a change is genuinely untestable does it flag "unverifiable" at the gate (R-32),
+never silently assumed safe. If the change adds uncovered code, the Critic surfaces it.
 
 **R-33. Tier models by task difficulty — big model plans, cheap models execute.**
 Each agent's model is configured independently (extends R-18). The mechanism is
@@ -313,6 +320,80 @@ not accessible"), flag needs_human, and block until a valid repo is provided. Sa
 missing/empty repo or a clone failure at diagnosis — surface it (UI + Jira comment +
 needs_human), never silently proceed or no-op. This is R-11 ("never fail silently")
 applied to repos.
+
+**R-42. Public-first repo access; private repos use an encrypted UI-entered token.**
+Works for ANY repo the ticket names — never a hardcoded or single repo (the repo is
+always dynamic, R-26). Default to anonymous clone/read — any public repo needs no token
+and works instantly (primary path). If an anonymous clone fails because the repo is
+private/inaccessible: surface it (R-41) — the UI offers a masked, password-type token
+field FOR THAT REPO, and a Jira comment notes it. Tokens are stored per-repo
+(`repo_tokens` keyed by owner/repo), so many different private repos each carry their own
+token. A UI-entered token is a credential: store it ENCRYPTED at rest (symmetric key from
+env, decrypt only in memory during the clone), reuse it for that repo, and NEVER log it,
+return it in any response, or show it after entry (R-17). Clone flow (per repo): try
+public → on auth failure use that repo's saved token → else prompt via UI/comment.
+Cross-owner private access this way needs no GitHub App; a GitHub App remains the future
+option for true multi-tenant install-based access.
+
+**R-43. One active subtask per ticket; supersede cleanly on re-pick.**
+A ticket has at most ONE active (running/waiting) subtask at a time — never a pile of
+zombie "running" subtasks. When a ticket is re-picked (e.g. In Progress → To Do → claimed
+again), the reconciler/poller must: (1) summarise the previous subtask (what it did, where
+it stopped), (2) post that summary as a comment on the Jira ticket so the human sees the
+history, (3) close/supersede the old subtask, then (4) start a fresh one. The summary is
+also the record reused if the ticket returns. Never leave an old subtask "running" when a
+new run begins — orphaned runs confuse the UI and waste state. (Extends reconciliation
+R-28 to the subtask lifecycle.)
+
+**R-44. Monitor human Jira comments; commands route through the gate, never auto-act.**
+The tool reads human comments on a ticket and classifies intent: COMMAND (stop, redo,
+add work), QUESTION (why this repo? status?), or CHATTER (discussion, thanks). Commands
+NEVER auto-act — they are turned into a proposal that goes through the normal human gate
++ approval (R-30); a comment requests, it does not override. Questions get an answer
+(comment back). Chatter is ignored. Guardrails: (1) only ACT on comments from authorized
+users (permission-checked, R-38); (2) NEVER read the tool's own comments as instructions
+(filter by author — prevents self-triggering loops); (3) when intent is ambiguous, ASK
+for clarification rather than guessing (R-10); (4) each comment processed once
+(idempotent by delivery id). Built in Phase 5.5 on the comment webhook.
+
+**R-45. The UI is the complete interface — every action is a button, not a command.**
+Anything a user needs to do is doable from the web UI with a click: run poll, resolve
+repos, confirm repos, change repo, run diagnosis, approve/reject at the gate, view a
+ticket's detail (diagnosis, plan, subtasks, status, budget), retry/resolve escalations.
+Debug curl endpoints may exist for testing, but they are NEVER the intended way to
+operate the tool — the UI covers everything. UI consistency rules: show "Resolve repos"
+ONLY when a ticket has no confirmed repo; once confirmed, hide it, show the repo, and
+offer a "Change repo" option to re-resolve. Buttons reflect current state (don't show
+actions that don't apply).
+
+**R-46. Ground every agent in the repo's ACTUAL files — never assume a file exists.**
+Diagnosis, Step-Planner, and Executor must work from the real repository contents, not
+assumed conventions. Before referencing or editing a file, verify it exists (list/read
+the real repo). The plan and execution operate on files that ARE there; the Executor may
+CREATE a file when genuinely needed (creating it before referencing it), EDIT existing
+files, or DELETE files the fix requires — but it must never assume a filename (e.g.
+`test_app.py`) exists or run a tool against a file it never confirmed. Tests: run against
+what the repo actually has; on "no tests collected" (pytest exit 5), treat as
+"no tests present," not a failure — create a test if the plan calls for it, else flag
+unverifiable (R-32). Distinguish exit 0 (pass) / 1 (real failure) / 5 (none collected).
+When writing that test, ground it in the REAL current content of the file(s) it
+covers (not just the diagnosis's prose summary) and, if one exists, an existing test
+file's real framework/conventions — a name recalled only from prose, not from the
+actual source, is how a written test ends up calling something that was never
+imported (NameError). A failure whose output names an import/name error gets a
+targeted repair hint, not a generic "pytest failed."
+
+Local pytest is the fast gate; when the repo has CI configured on the PR, CI is the
+**authoritative** check — if they disagree, CI wins. This never blocks the flow (CI
+is checked on demand, not polled/awaited); both results are surfaced in the UI.
+
+**R-47. Ticket comments are a two-way chat, not one-way narration.**
+The Jira ticket is a conversation: the tool narrates steps (R-40) AND reads + responds
+to human replies (R-44), back and forth, like a chat thread. A human can ask, instruct,
+or correct mid-flow; the tool reads it, responds (answer, or a gated proposal for
+commands), and continues — so the ticket reads as a genuine dialogue between the human
+and the tool, each aware of the other's messages (tool never treats its own messages as
+input; permission-checked; ambiguity → ask).
 
 ---
 

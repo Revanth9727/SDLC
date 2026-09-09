@@ -313,6 +313,34 @@ class JiraTool:
         bodies = [self.extract_plain_text(comment.get("body")) for comment in comments]
         return " ".join(body for body in bodies if body)
 
+    def recent_comments(self, key: str, limit: int = 12) -> list[dict[str, Any]]:
+        """The recent comment thread (oldest first), for conversational context (R-47).
+
+        Distinct from ``_comments_text`` (which flattens everything for URL scanning):
+        this keeps each message separate and marks which side wrote it, so an agent
+        can read the exchange as a dialogue instead of one undifferentiated blob.
+        """
+        with self._client() as client:
+            resp = client.get(f"/rest/api/3/issue/{key}/comment",
+                              params={"maxResults": limit, "orderBy": "-created"})
+            resp.raise_for_status()
+        own_id = self.own_account_id()
+        thread = []
+        for item in resp.json().get("comments", []):
+            body = self.extract_plain_text(item.get("body")).strip()
+            if not body:
+                continue
+            author = item.get("author") or {}
+            thread.append({
+                "id": item.get("id"),
+                "from_tool": author.get("accountId") == own_id,
+                "author": author.get("displayName", "unknown"),
+                "body": body[:1000],
+                "created": item.get("created"),
+            })
+        thread.reverse()
+        return thread
+
     def list_by_status(self, status_name: str) -> list[JiraIssue]:
         """Return issues for the configured project with exactly ``status_name``."""
         jql = f'project = {self._project} AND status = "{status_name}" ORDER BY created ASC'
@@ -401,6 +429,13 @@ class JiraTool:
         return transitions
 
     def set_status(self, key: str, internal_stage: str) -> dict[str, Any]:
+        try:
+            return self._set_status(key, internal_stage)
+        except Exception:
+            logger.warning('jira.set_status unavailable key=%r stage=%r', key, internal_stage)
+            return {'applied': False, 'from': '', 'to': None, 'reason': 'Jira status transition unavailable'}
+
+    def _set_status(self, key: str, internal_stage: str) -> dict[str, Any]:
         """Transition a Jira issue to the status mapped from ``internal_stage``.
 
         Never raises — if no matching transition is found, logs a warning and
@@ -690,7 +725,7 @@ class JiraTool:
         """Compatibility alias; stuck detection now covers all non-terminal statuses."""
         return self.list_non_terminal_stuck(threshold_minutes)
 
-    def comment(self, key: str, body: str) -> None:
+    def comment(self, key: str, body: str) -> str:
         """Post a plain-text comment to the given Jira issue."""
         logger.info("jira.comment key=%r body_len=%d", key, len(body))
         payload = {
@@ -709,3 +744,13 @@ class JiraTool:
             resp = client.post(f"/rest/api/3/issue/{key}/comment", json=payload)
             resp.raise_for_status()
         logger.info("jira.comment -> posted to %r", key)
+        return str(resp.json()["id"])
+
+
+    def own_account_id(self) -> str:
+        if settings.jira_bot_account_id:
+            return settings.jira_bot_account_id
+        with self._client() as client:
+            response = client.get('/rest/api/3/myself')
+            response.raise_for_status()
+            return response.json()['accountId']

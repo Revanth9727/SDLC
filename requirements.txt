@@ -6,8 +6,8 @@ sse-starlette==2.1.*
 python-multipart==0.0.*
 
 # agents / orchestration
-langgraph==0.2.*
-langgraph-checkpoint-postgres==1.*
+langgraph==0.2.76
+langgraph-checkpoint-postgres==2.0.21
 langchain-core==0.3.*
 openai==1.54.*
 

@@ -2,6 +2,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+from sqlalchemy import Enum as SAEnum
 from sqlalchemy import DateTime, ForeignKey, Index, JSON, String, Text, text
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
@@ -100,6 +101,15 @@ class Subtask(Base):
 
     ticket: Mapped["Ticket"] = relationship("Ticket", back_populates="subtasks")
 
+    __table_args__ = (
+        Index(
+            "uq_subtasks_one_active_per_ticket",
+            "ticket_id",
+            unique=True,
+            postgresql_where=text("status IN ('running', 'waiting', 'pending')"),
+        ),
+    )
+
 
 class TicketEvent(Base):
     """One structured event emitted during a ticket's lifecycle (R-7, R-23).
@@ -146,4 +156,48 @@ class RepoToken(Base):
         DateTime(timezone=True),
         nullable=False,
         default=lambda: datetime.now(timezone.utc),
+    )
+
+
+class WebhookDelivery(Base):
+    __tablename__ = 'webhook_deliveries'
+    id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    source: Mapped[str] = mapped_column(String(16))
+    event: Mapped[str] = mapped_column(String(64))
+    payload: Mapped[dict] = mapped_column(JSONB)
+    status: Mapped[str] = mapped_column(String(16), default='pending')
+    attempts: Mapped[int] = mapped_column(default=0)
+    error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+
+class PRLink(Base):
+    __tablename__ = 'pr_links'
+    github_pr_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    jira_issue_key: Mapped[str] = mapped_column(String(64), index=True)
+    repo: Mapped[str] = mapped_column(String(256))
+    number: Mapped[int] = mapped_column()
+    branch: Mapped[str] = mapped_column(String(256))
+    url: Mapped[str] = mapped_column(Text)
+    pr_state: Mapped[str] = mapped_column(String(16))
+    notified_state: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    jira_category: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+
+class PendingApproval(Base):
+    __tablename__ = 'pending_approvals'
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    ticket_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey('tickets.id', ondelete='CASCADE'))
+    subtask_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), ForeignKey('subtasks.id', ondelete='CASCADE'), nullable=True, unique=True)
+    jira_issue_key: Mapped[str] = mapped_column(String(64))
+    proposed_action: Mapped[dict] = mapped_column(JSONB)
+    status: Mapped[str] = mapped_column(SAEnum('PENDING', 'APPROVED', 'REJECTED', 'EXPIRED', name='approval_status'), default='PENDING')
+    jira_comment_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    source_comment_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, unique=True)
+    decision_note: Mapped[str] = mapped_column(Text, default='')
+    requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    resolved_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    __table_args__ = (
+        Index('ix_pending_approvals_issue', 'jira_issue_key', postgresql_where=text("status = 'PENDING'")),
     )

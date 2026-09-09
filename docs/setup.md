@@ -219,6 +219,12 @@ STUCK_THRESHOLD_MINUTES=120
 # the webhooks in GitHub/Jira. Use smee.io or ngrok to expose localhost during dev.
 GITHUB_WEBHOOK_SECRET=REPLACE_ME
 JIRA_WEBHOOK_SECRET=REPLACE_ME
+
+# --- Repo access (R-42) ---
+# Public repos clone with no token. For PRIVATE repos, users enter a token in the UI;
+# it's encrypted at rest with this key. Generate one:
+#   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+APP_ENCRYPTION_KEY=REPLACE_ME
 EOF
 
 git add .env.example docker-compose.yml .gitignore

@@ -18,6 +18,7 @@ import httpx
 from github.GithubException import UnknownObjectException
 
 from app.config import settings
+from app.core.failures import describe_failure
 from app.db.connection import SessionLocal
 from app.db.models import Ticket
 from app.tools.jira_tool import JiraTool
@@ -153,7 +154,7 @@ def _step3_reporter(key: str) -> list[str]:
 
 
 def _validate_candidates(candidates: list[str], issue_key: str) -> ResolveResult | None:
-    invalid: list[str] = []
+    invalid: list[tuple[str, str]] = []
     private: list[str] = []
     tool = RepoTool()
     for repo in candidates:
@@ -166,18 +167,20 @@ def _validate_candidates(candidates: list[str], issue_key: str) -> ResolveResult
             private.append(repo)
         except Exception as exc:
             logger.warning("resolve.validate repo=%r not reachable: %s", repo, exc)
-            invalid.append(repo)
+            invalid.append((repo, describe_failure(f"Validating repository {repo}", exc)))
 
     if private:
         error = "this repo is private — enter a token to access it"
         return ResolveResult(source="private_repo", candidates=private, error=error, private_repos=private)
 
     if invalid:
-        if len(invalid) == 1:
-            error = f"repo {invalid[0]} not found or not accessible"
-        else:
-            error = f"repos {invalid} not found or not accessible"
-        return ResolveResult(source="invalid_repo", candidates=[], error=error, invalid_repos=invalid)
+        error = "; ".join(reason for _repo, reason in invalid)
+        return ResolveResult(
+            source="invalid_repo",
+            candidates=[],
+            error=error,
+            invalid_repos=[repo for repo, _reason in invalid],
+        )
     return None
 
 

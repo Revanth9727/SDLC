@@ -9,6 +9,7 @@ import json
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
+from uuid import UUID
 
 from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
@@ -22,6 +23,8 @@ from app.agents.state import SubtaskState
 from app.core.ownership import owner_of_key
 from app.core.poller import poll_cycle, start_loop
 from app.core.steps import post_step
+from app.core.subtasks import cleanup_active_subtask_pile, prepare_subtask
+from app.core.failures import describe_failure
 from app.orchestrator.graph import run_diagnosis_graph
 from app.db.connection import SessionLocal
 from app.db.models import Subtask, Ticket, TicketEvent
@@ -30,6 +33,7 @@ from app.tools.jira_tool import JiraTool
 from app.tools.repo_tokens import RepoTokenStore
 from app.tools.repo_tool import RepoAccessRequired, RepoTool
 from app.tools.repo_resolver import resolve_repos
+from app.web.approval import router as approval_router, persist_state
 
 logger = logging.getLogger(__name__)
 
@@ -46,16 +50,26 @@ async def _broadcast(event: dict) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    cleaned = await asyncio.to_thread(cleanup_active_subtask_pile)
+    if cleaned:
+        logger.info("startup: superseded %d duplicate active subtask(s)", cleaned)
+    from app.db.models import WebhookDelivery, PRLink, PendingApproval
+    from app.db.connection import engine
+    for table in (WebhookDelivery.__table__, PRLink.__table__, PendingApproval.__table__):
+        await asyncio.to_thread(table.create, engine, checkfirst=True)
+    from app.core.webhook_processing import recover_deliveries
+    recovery = asyncio.create_task(recover_deliveries())
     task = await start_loop(_broadcast)
     yield
+    recovery.cancel()
     task.cancel()
-    try:
-        await task
-    except asyncio.CancelledError:
-        pass
+    await asyncio.gather(task, recovery, return_exceptions=True)
 
 
 app = FastAPI(title="Agentic SDLC", lifespan=lifespan)
+app.include_router(approval_router)
+from app.web.webhooks import router as webhook_router
+app.include_router(webhook_router)
 
 app.mount(
     "/static",
@@ -168,16 +182,23 @@ def debug_ownership(key: str) -> JSONResponse:
 
 
 @app.post("/ticket/{key}/resolve-repos", response_class=JSONResponse)
+@app.post("/tickets/{key}/resolve-repos", response_class=JSONResponse)
 async def ticket_resolve_repos(key: str) -> JSONResponse:
     """Run the repo-resolver cascade for a Jira issue key, return candidates, stream event."""
-    result = resolve_repos(key)
+    ticket = _ticket_ref_by_identifier(key)
+    issue_key = ticket.get("external_key") if ticket else key
+    result = (
+        {"source": "needs_paste", "candidates": []}
+        if ticket and not issue_key
+        else resolve_repos(issue_key)
+    )
     if result.get("error"):
-        ticket = _ensure_jira_ticket_ref(key)
+        ticket = ticket or _ensure_jira_ticket_ref(issue_key)
         _flag_needs_human(ticket["id"])
         await post_step(ticket, result["error"], stage="blocked", emit=_broadcast)
-        await _broadcast({"type": "resolve_result", "key": key, **result})
+        await _broadcast({"type": "resolve_result", "key": issue_key or key, **result})
         return JSONResponse(status_code=422, content=result)
-    await _broadcast({"type": "resolve_result", "key": key, **result})
+    await _broadcast({"type": "resolve_result", "key": issue_key or key, **result})
     return JSONResponse(content=result)
 
 
@@ -218,7 +239,7 @@ async def poll_run_once() -> JSONResponse:
 
 @app.post("/tickets/{ticket_id}/diagnose", response_class=JSONResponse)
 async def diagnose_ticket(ticket_id: str) -> JSONResponse:
-    """Create one subtask from a ticket and run the minimal Diagnosis graph."""
+    """Diagnose and plan one subtask, returning at the checkpointed approval gate."""
     missing_repo_step: dict | None = None
     with SessionLocal() as db:
         ticket = db.get(Ticket, ticket_id)
@@ -232,19 +253,10 @@ async def diagnose_ticket(ticket_id: str) -> JSONResponse:
         else:
             error = ""
             repo = ticket.repos[0].strip()
-            subtask = Subtask(
-                ticket_id=ticket.id,
-                type="bug",
-                description=ticket.description,
-                status="running",
-                depends_on=[],
-            )
-            db.add(subtask)
-            db.commit()
-            db.refresh(subtask)
+            jira_key = ticket.external_key
             title = ticket.title
             description = ticket.description
-            subtask_id = str(subtask.id)
+            ticket_uuid = ticket.id
 
     if missing_repo_step is not None:
         await post_step(
@@ -255,29 +267,49 @@ async def diagnose_ticket(ticket_id: str) -> JSONResponse:
         )
         return JSONResponse(status_code=422, content={"error": error})
 
+    replacement = await asyncio.to_thread(
+        prepare_subtask,
+        ticket_uuid,
+        description=description,
+        jira=JiraTool(),
+        reuse_fresh_pending=True,
+    )
+    for item in replacement.superseded:
+        await ev.publish(ticket_id, {
+            "type": "subtask_superseded",
+            "ticket_id": ticket_id,
+            "subtask_id": item["subtask_id"],
+            "agent": "subtask_lifecycle",
+            "stage": "superseded",
+            "message": item["message"],
+        })
+    subtask_id = replacement.subtask_id
+    with SessionLocal() as db:
+        subtask = db.get(Subtask, subtask_id)
+        subtask.status = "running"
+        db.get(Ticket, ticket_uuid).status = "processing"
+        db.commit()
+
     state = SubtaskState(
         ticket_id=ticket_id,
+        jira_key=jira_key,
         subtask_id=subtask_id,
         subtask_type="bug",
         description=f"{title}\n\n{description}".strip(),
         repo=repo,
     )
     try:
-        RepoTool().clone_or_pull(repo, subtask_id)
-        final_state = await run_diagnosis_graph(state)
+        await asyncio.to_thread(RepoTool().clone_or_pull, repo, subtask_id)
     except RepoAccessRequired as exc:
-        error = "this repo is private — enter a token to access it"
+        error = describe_failure(f"Cloning repository {repo}", exc)
         logger.warning("diagnose_ticket private repo needs token ticket_id=%r repo=%r", ticket_id, repo)
+        state.status = "needs_human"
+        state.failure_reason = error
+        await asyncio.to_thread(persist_state, state)
         blocked_step: dict | None = None
         with SessionLocal() as db:
-            subtask = db.get(Subtask, subtask_id)
-            if subtask is not None:
-                subtask.status = "needs_human"
             ticket = db.get(Ticket, ticket_id)
-            if ticket is not None:
-                ticket.status = "needs_human"
-                blocked_step = _ticket_step_ref(ticket)
-            db.commit()
+            blocked_step = _ticket_step_ref(ticket) if ticket is not None else None
         if blocked_step is not None:
             await post_step(blocked_step, error, stage="blocked", emit=_broadcast)
         return JSONResponse(
@@ -289,18 +321,15 @@ async def diagnose_ticket(ticket_id: str) -> JSONResponse:
             },
         )
     except Exception as exc:
-        error = f"repo {repo} could not be cloned or diagnosed: {exc}"
-        logger.exception("diagnose_ticket failed ticket_id=%r repo=%r", ticket_id, repo)
+        error = describe_failure(f"Cloning repository {repo}", exc)
+        logger.exception("diagnose_ticket clone failed ticket_id=%r repo=%r", ticket_id, repo)
+        state.status = "needs_human"
+        state.failure_reason = error
+        await asyncio.to_thread(persist_state, state)
         blocked_step: dict | None = None
         with SessionLocal() as db:
-            subtask = db.get(Subtask, subtask_id)
-            if subtask is not None:
-                subtask.status = "needs_human"
             ticket = db.get(Ticket, ticket_id)
-            if ticket is not None:
-                ticket.status = "needs_human"
-                blocked_step = _ticket_step_ref(ticket)
-            db.commit()
+            blocked_step = _ticket_step_ref(ticket) if ticket is not None else None
         if blocked_step is not None:
             await post_step(
                 blocked_step,
@@ -310,35 +339,25 @@ async def diagnose_ticket(ticket_id: str) -> JSONResponse:
             )
         return JSONResponse(status_code=422, content={"error": error, "repo": repo})
 
-    with SessionLocal() as db:
-        subtask = db.get(Subtask, subtask_id)
-        if subtask is not None:
-            subtask.status = final_state.status
-            subtask.state = final_state.model_dump(mode="json")
-        ticket = db.get(Ticket, ticket_id)
-        if ticket is not None and final_state.status == "needs_human":
-            ticket.status = "needs_human"
-        ticket_for_step = _ticket_step_ref(ticket) if ticket is not None else None
-        db.commit()
+    try:
+        final_state = await run_diagnosis_graph(state)
+    except Exception as exc:
+        error = describe_failure("Running the diagnosis and planning workflow", exc)
+        logger.exception("diagnose_ticket workflow failed ticket_id=%r repo=%r", ticket_id, repo)
+        state.status = "needs_human"
+        state.failure_reason = error
+        await asyncio.to_thread(persist_state, state)
+        with SessionLocal() as db:
+            ticket = db.get(Ticket, ticket_id)
+            blocked_step = _ticket_step_ref(ticket) if ticket is not None else None
+        if blocked_step is not None:
+            await post_step(blocked_step, f"Blocked: {error}", stage="blocked", emit=_broadcast)
+        return JSONResponse(status_code=422, content={"error": error, "repo": repo})
 
-    if ticket_for_step is not None:
-        if final_state.status == "needs_human":
-            await post_step(
-                ticket_for_step,
-                f"Blocked: diagnosis could not find a root cause ({final_state.failure_reason})",
-                stage="blocked",
-                emit=_broadcast,
-            )
-        else:
-            diagnosis = final_state.diagnosis or {}
-            files = diagnosis.get("files") or []
-            file_text = files[0] if files else "the inspected files"
-            await post_step(
-                ticket_for_step,
-                f"Found: {diagnosis.get('root_cause', '')} in {file_text}",
-                stage="diagnosis_complete",
-                emit=_broadcast,
-            )
+    await asyncio.to_thread(persist_state, final_state)
+    await ev.log_event(ticket_id=ticket_id, subtask_id=subtask_id, agent="orchestrator",
+                       stage="paused" if final_state.approval_payload else "needs_human",
+                       message="Plan saved; waiting for approval" if final_state.approval_payload else final_state.failure_reason)
 
     await _broadcast(
         {
@@ -347,6 +366,8 @@ async def diagnose_ticket(ticket_id: str) -> JSONResponse:
             "subtask_id": subtask_id,
             "status": final_state.status,
             "diagnosis": final_state.diagnosis,
+            "plan": final_state.model_dump(mode="json")["plan"],
+            "approval_status": final_state.approval_status,
         }
     )
     return JSONResponse(
@@ -355,6 +376,8 @@ async def diagnose_ticket(ticket_id: str) -> JSONResponse:
             "subtask_id": subtask_id,
             "status": final_state.status,
             "diagnosis": final_state.diagnosis,
+            "plan": final_state.model_dump(mode="json")["plan"],
+            "approval_status": final_state.approval_status,
             "repo": repo,
         }
     )
@@ -435,9 +458,12 @@ def ticket_event_history(ticket_id: str) -> JSONResponse:
 
 
 @app.post("/ticket/{key}/confirm-repos", response_class=JSONResponse)
+@app.post("/tickets/{key}/confirm-repos", response_class=JSONResponse)
 async def ticket_confirm_repos(key: str, body: _ConfirmReposRequest) -> JSONResponse:
     """Validate each repo is reachable on GitHub, then store on the ticket row."""
-    invalid: list[str] = []
+    existing_ticket = _ticket_ref_by_identifier(key)
+    issue_key = existing_ticket.get("external_key") if existing_ticket else key
+    invalid: list[tuple[str, str]] = []
     private: list[str] = []
     token_store: RepoTokenStore | None = None
 
@@ -453,10 +479,11 @@ async def ticket_confirm_repos(key: str, body: _ConfirmReposRequest) -> JSONResp
                 token_store.save(repo, token.strip())
         except Exception as exc:
             logger.warning("confirm_repos: failed to save private repo token: %s", exc)
+            error = describe_failure("Encrypting and storing the private repository token", exc)
             return JSONResponse(
                 status_code=422,
                 content={
-                    "error": "APP_ENCRYPTION_KEY is required before private repo tokens can be saved",
+                    "error": error,
                     "code": "encryption_key_required",
                 },
             )
@@ -472,10 +499,10 @@ async def ticket_confirm_repos(key: str, body: _ConfirmReposRequest) -> JSONResp
             private.append(repo)
         except Exception as exc:
             logger.warning("confirm_repos: %r not reachable: %s", repo, exc)
-            invalid.append(repo)
+            invalid.append((repo, describe_failure(f"Validating repository {repo}", exc)))
 
     if private:
-        ticket = _ensure_jira_ticket_ref(key)
+        ticket = existing_ticket or _ensure_jira_ticket_ref(issue_key)
         _flag_needs_human(ticket["id"])
         message = "this repo is private — enter a token to access it"
         await post_step(ticket, message, stage="blocked", emit=_broadcast)
@@ -489,25 +516,27 @@ async def ticket_confirm_repos(key: str, body: _ConfirmReposRequest) -> JSONResp
         )
 
     if invalid:
-        ticket = _ensure_jira_ticket_ref(key)
+        ticket = existing_ticket or _ensure_jira_ticket_ref(issue_key)
         _flag_needs_human(ticket["id"])
-        if len(invalid) == 1:
-            message = f"repo {invalid[0]} not found or not accessible"
-        else:
-            message = f"repos {invalid} not found or not accessible"
+        message = "; ".join(reason for _repo, reason in invalid)
         await post_step(ticket, message, stage="blocked", emit=_broadcast)
         return JSONResponse(
             status_code=422,
-            content={"error": message, "invalid_repos": invalid},
+            content={
+                "error": message,
+                "invalid_repos": [repo for repo, _reason in invalid],
+            },
         )
 
     with SessionLocal() as db:
-        ticket = db.query(Ticket).filter(Ticket.external_key == key).first()
+        ticket = db.get(Ticket, existing_ticket["id"]) if existing_ticket else None
         if ticket is None:
-            issue = JiraTool().get_issue(key)
+            ticket = db.query(Ticket).filter(Ticket.external_key == issue_key).first()
+        if ticket is None:
+            issue = JiraTool().get_issue(issue_key)
             ticket = Ticket(
                 source="jira",
-                external_key=key,
+                external_key=issue_key,
                 title=issue["summary"],
                 description=issue["description"],
                 repos=body.repos,
@@ -554,6 +583,19 @@ def _flag_needs_human(ticket_id) -> None:
         if ticket is not None:
             ticket.status = "needs_human"
             db.commit()
+
+
+def _ticket_ref_by_identifier(identifier: str) -> dict | None:
+    """Resolve one local UUID or Jira key without fetching unrelated tickets."""
+    with SessionLocal() as db:
+        try:
+            local_id = UUID(identifier)
+        except ValueError:
+            local_id = None
+        ticket = db.get(Ticket, local_id) if local_id else None
+        if ticket is None:
+            ticket = db.query(Ticket).filter(Ticket.external_key == identifier).first()
+        return _ticket_step_ref(ticket) if ticket is not None else None
 
 
 def _ticket_step_ref(ticket: Ticket) -> dict:

@@ -11,6 +11,9 @@ class _FakeRepoTool:
     def __init__(self) -> None:
         self.reads: list[str] = []
 
+    def revision(self, repo, subtask_id):
+        return "a" * 40
+
     def list_files(self, repo: str, subtask_id: str) -> list[str]:
         return ["README.md", "app.py", "tests/test_app.py", "image.png"]
 
@@ -85,7 +88,7 @@ def test_diagnosis_agent_has_no_root_cause_exit() -> None:
     result = agent.run(_state())
 
     assert result.status == "needs_human"
-    assert result.failure_reason == "NoRootCause"
+    assert result.failure_reason == "Diagnosis could not determine a root cause: Insufficient files."
 
 
 class _FakeAgent:
@@ -107,14 +110,21 @@ async def test_minimal_graph_runs_diagnosis_node(monkeypatch) -> None:
         events.append(kwargs)
         return kwargs
 
-    monkeypatch.setattr(graph_module, "_checkpointer", lambda: False)
     monkeypatch.setattr(graph_module, "log_event", fake_log_event)
 
-    app = graph_module.build_graph(agent=_FakeAgent())
+    from langgraph.checkpoint.memory import MemorySaver
+
+    class CannotPlan:
+        def run(self, state):
+            state.status, state.failure_reason = "needs_human", "CannotPlan"
+            return state
+
+    app = graph_module.build_graph(agent=_FakeAgent(), planner=CannotPlan(), checkpointer=MemorySaver())
     result = await app.ainvoke(
         _state().model_dump(),
         config={"configurable": {"thread_id": "test-thread"}},
     )
 
     assert result["diagnosis"]["root_cause"] == "divide() does not guard b == 0"
-    assert [event["stage"] for event in events] == ["started", "done"]
+    assert [event["stage"] for event in events][:2] == ["started", "done"]
+    assert result["failure_reason"] == "CannotPlan"

@@ -34,7 +34,8 @@ class GitHubTool:
     passed explicitly.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, repo_tool=None) -> None:
+        self.repo_tool = repo_tool
         self._client = Github(auth=Auth.Token(settings.github_token))
 
     def _check_allowlist(self, full_name: str) -> None:
@@ -59,7 +60,13 @@ class GitHubTool:
         target = full_name or _sandbox_full_name()
         logger.info("github.get_repo repo=%r", target)
         self._check_allowlist(target)
-        repo = self._client.get_repo(target)
+        client = self._client
+        if settings.app_encryption_key:
+            from app.tools.repo_tokens import RepoTokenStore
+            token = RepoTokenStore().get(target)
+            if token:
+                client = Github(auth=Auth.Token(token))
+        repo = client.get_repo(target)
         logger.info("github.get_repo -> default_branch=%r", repo.default_branch)
         return repo
 
@@ -102,3 +109,80 @@ class GitHubTool:
         )
         logger.info("github.open_pr -> pr_url=%r", pr.html_url)
         return pr.html_url
+
+    def find_pr(self, full_name: str, branch: str) -> dict | None:
+        repo = self.get_repo(full_name)
+        for pr in repo.get_pulls(state="all", head=f"{repo.owner.login}:{branch}"):
+            return {"id": str(pr.id), "number": pr.number, "url": pr.html_url,
+                    "state": "merged" if pr.merged else pr.state, "branch": branch,
+                    "repo": full_name}
+        return None
+
+    def publish_changes(self, state) -> dict:
+        from app.tools.repo_tool import RepoTool
+        if state.approval_status != 'approved' or not state.execution_complete:
+            raise ValueError('Publication requires approved, completed execution')
+        # exit 5 (no tests collected) is not a failure (ai_rules.md R-46) — a step
+        # is publishable if it truly passed, or was honestly inconclusive.
+        if not state.steps_done or not all(
+                step['tests']['outcome'] in ('passed', 'no_tests_collected') for step in state.steps_done):
+            raise ValueError('Every step must have passing or inconclusive (no-tests) results')
+        tool = self.repo_tool or RepoTool(github=self)
+        branch = tool.branch_name(state.subtask_id)
+        existing = self.find_pr(state.repo, branch)
+        if existing:
+            if existing['state'] != 'open':
+                raise ValueError('The subtask PR is already closed/merged; start a fresh approved attempt')
+            return existing
+        tool.push_changes(state.repo, state.subtask_id, state.base_commit, state.file_changes)
+        title = f"{state.jira_key or 'SDLC'}: {state.description.splitlines()[0][:180]}"
+        body = 'Implements the approved plan:\n\n' + '\n'.join(
+            f'- {step.intent} (`{step.target_file}`)' for step in state.plan)
+        if state.verifiability == 'no_tests':
+            body += ('\n\n**Unverifiable:** this repository has no tests, so this change could not be run '
+                     'against a test suite — please review manually.\n')
+        body += '\n\nValidation: pytest passed after each step.\n\n' + (f'Jira: {state.jira_key}' if state.jira_key else '')
+        self.open_pr(state.repo, branch, title, body)
+        result = self.find_pr(state.repo, branch)
+        if not result:
+            raise RuntimeError('PR creation returned without a discoverable PR')
+        return result
+
+    def pr_snapshot(self, full_name: str, number: int) -> dict:
+        pr = self.get_repo(full_name).get_pull(number)
+        return {'id': str(pr.id), 'number': pr.number, 'url': pr.html_url,
+                'state': 'merged' if pr.merged else pr.state, 'branch': pr.head.ref,
+                'title': pr.title, 'repo': full_name}
+
+    def comment_pr(self, full_name: str, number: int, message: str) -> None:
+        self.get_repo(full_name).get_issue(number).create_comment(message)
+
+
+    def pr_commit_messages(self, full_name: str, number: int) -> list[str]:
+        commits = self.get_repo(full_name).get_pull(number).get_commits()
+        return [commit.commit.message for commit in commits[:50]]
+
+    def pr_checks(self, full_name: str, number: int) -> dict:
+        """Aggregate CI status for a PR's head commit — CI is the authoritative
+        gate (ai_rules.md R-32/R-46); this only surfaces it, never blocks on it.
+        Covers GitHub Actions (Checks API) and classic/third-party CI (Status
+        API) generically — never assumes which one a repo uses."""
+        pr = self.get_repo(full_name).get_pull(number)
+        commit = self.get_repo(full_name).get_commit(pr.head.sha)
+        runs = [{'name': r.name, 'status': r.status, 'conclusion': r.conclusion, 'url': r.html_url}
+                for r in commit.get_check_runs()]
+        if runs:
+            completed = all(r['status'] == 'completed' for r in runs)
+            failed = any(r['conclusion'] not in ('success', 'neutral', 'skipped') for r in runs if r['conclusion'])
+            return {'configured': True, 'status': 'completed' if completed else 'in_progress',
+                    'conclusion': ('failure' if failed else 'success') if completed else None,
+                    'url': runs[0]['url'], 'runs': runs}
+        combined = commit.get_combined_status()
+        if combined.statuses:
+            runs = [{'name': s.context, 'status': 'completed' if s.state != 'pending' else 'in_progress',
+                     'conclusion': s.state if s.state != 'pending' else None, 'url': s.target_url}
+                    for s in combined.statuses]
+            return {'configured': True, 'status': 'completed' if combined.state != 'pending' else 'in_progress',
+                    'conclusion': combined.state if combined.state != 'pending' else None,
+                    'url': runs[0]['url'] if runs else None, 'runs': runs}
+        return {'configured': False, 'status': 'none', 'conclusion': None, 'url': None, 'runs': []}

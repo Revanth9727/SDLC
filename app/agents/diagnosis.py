@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from app.agents.llm import LLMClient
 from app.agents.router import model_tier
 from app.agents.state import BudgetUsed, SubtaskState
+from app.core.failures import describe_failure
 from app.tools.repo_tool import RepoTool
 
 logger = logging.getLogger(__name__)
@@ -42,6 +43,7 @@ class DiagnosisAgent:
     def run(self, state: SubtaskState) -> SubtaskState:
         """Run diagnosis and return the updated blackboard state."""
         files = self.repo_tool.list_files(state.repo, state.subtask_id)
+        state.base_commit = self.repo_tool.revision(state.repo, state.subtask_id)
         selected = self._shortlist_files(files, state.description)
         snippets = self._read_snippets(state.repo, state.subtask_id, selected)
 
@@ -57,7 +59,8 @@ class DiagnosisAgent:
         state.budget_used = BudgetUsed.model_validate(self.llm.get_usage(state.ticket_id))
         if diagnosis.no_root_cause or not diagnosis.root_cause.strip():
             state.status = "needs_human"
-            state.failure_reason = "NoRootCause"
+            reason = diagnosis.reasoning.strip() or "the available ticket and repository evidence was insufficient"
+            state.failure_reason = f"Diagnosis could not determine a root cause: {reason}"
         return state
 
     def _shortlist_files(self, files: Sequence[str], description: str) -> list[str]:
@@ -95,13 +98,17 @@ class DiagnosisAgent:
 
     def _read_snippets(self, repo: str, subtask_id: str, files: Sequence[str]) -> list[dict[str, str]]:
         snippets: list[dict[str, str]] = []
+        failures: list[str] = []
         for path in files:
             try:
                 text = self.repo_tool.read_file(repo, subtask_id, path)
             except Exception as exc:
                 logger.warning("diagnosis.read_file failed repo=%r path=%r: %s", repo, path, exc)
+                failures.append(describe_failure(f"Reading diagnosis file {path}", exc))
                 continue
             snippets.append({"path": path, "content": text[: self.max_chars_per_file]})
+        if files and not snippets:
+            raise RuntimeError("; ".join(failures))
         return snippets
 
     def _user_prompt(self, state: SubtaskState, snippets: list[dict[str, str]]) -> str:

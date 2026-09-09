@@ -8,6 +8,7 @@ import logging
 
 from app.db.connection import engine
 from app.db.models import Base
+from app.core.subtasks import cleanup_active_subtask_pile
 
 logger = logging.getLogger(__name__)
 
@@ -16,6 +17,9 @@ def create_all() -> None:
     """Create every table in Base.metadata if it does not already exist."""
     logger.info("Running create_all() against %s", engine.url)
     Base.metadata.create_all(bind=engine)
+    cleaned = cleanup_active_subtask_pile()
+    if cleaned:
+        logger.info("Superseded %d duplicate active subtask(s).", cleaned)
     logger.info("All tables created (or already existed).")
 
 

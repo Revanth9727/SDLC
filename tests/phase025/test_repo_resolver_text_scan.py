@@ -57,12 +57,11 @@ def test_resolve_repos_refuses_unreachable_candidate(monkeypatch) -> None:
 
     result = repo_resolver.resolve_repos("SCRUM-1")
 
-    assert result == {
-        "source": "invalid_repo",
-        "candidates": [],
-        "error": "repos ['owner/from-env', 'owner/from-comment'] not found or not accessible",
-        "invalid_repos": ["owner/from-env", "owner/from-comment"],
-    }
+    assert result["source"] == "invalid_repo"
+    assert result["candidates"] == []
+    assert result["invalid_repos"] == ["owner/from-env", "owner/from-comment"]
+    assert "Validating repository owner/from-env failed (RuntimeError): not found" in result["error"]
+    assert "Validating repository owner/from-comment failed (RuntimeError): not found" in result["error"]
 
 
 def test_resolve_repos_prompts_for_private_repo_token(monkeypatch) -> None:

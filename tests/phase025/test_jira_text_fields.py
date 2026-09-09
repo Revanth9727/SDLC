@@ -135,3 +135,53 @@ def test_get_issue_text_fields_includes_description_environment_and_comments(mon
     assert "github.com/owner/from-description" in fields["description"]
     assert "github.com/owner/from-environment" in fields["environment"]
     assert "github.com/owner/from-comment" in fields["comments"]
+
+
+def test_recent_comments_orders_oldest_first_and_marks_the_tools_own_messages(monkeypatch) -> None:
+    monkeypatch.setattr(
+        jira_tool,
+        "settings",
+        SimpleNamespace(
+            jira_base_url="https://example.atlassian.net",
+            jira_email="user@example.com",
+            jira_api_token="token",
+            jira_project_key="SCRUM",
+            jira_status_cache_ttl_seconds=300,
+            jira_bot_account_id="bot-1",
+        ),
+    )
+
+    class _ThreadClient(_FakeClient):
+        def get(self, path: str, params: dict | None = None) -> _FakeResponse:
+            if path == "/rest/api/3/issue/SCRUM-1/comment":
+                assert params == {"maxResults": 12, "orderBy": "-created"}
+                return _FakeResponse(
+                    {
+                        "comments": [
+                            {
+                                "id": "2",
+                                "author": {"accountId": "bot-1", "displayName": "Agent"},
+                                "body": {"type": "doc", "content": [
+                                    {"type": "paragraph", "content": [{"type": "text", "text": "Plan ready"}]}]},
+                                "created": "2026-01-02T00:00:00.000+0000",
+                            },
+                            {
+                                "id": "1",
+                                "author": {"accountId": "human-1", "displayName": "Alex"},
+                                "body": {"type": "doc", "content": [
+                                    {"type": "paragraph", "content": [{"type": "text", "text": "go ahead"}]}]},
+                                "created": "2026-01-01T00:00:00.000+0000",
+                            },
+                        ]
+                    }
+                )
+            raise AssertionError(path)
+
+    tool = JiraTool()
+    monkeypatch.setattr(tool, "_client", _ThreadClient)
+
+    thread = tool.recent_comments("SCRUM-1", limit=12)
+
+    assert [item["body"] for item in thread] == ["go ahead", "Plan ready"]  # oldest first
+    assert [item["from_tool"] for item in thread] == [False, True]
+    assert thread[1]["author"] == "Agent"
