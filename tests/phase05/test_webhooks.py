@@ -37,13 +37,23 @@ class Jira:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('source', ['github', 'jira'])
-async def test_signature_required_before_database(source, monkeypatch):
+async def test_github_signature_required_before_database(monkeypatch):
     app = FastAPI(); app.include_router(webhooks.router)
-    monkeypatch.setattr(webhooks.settings, source + '_webhook_secret', 'secret')
+    monkeypatch.setattr(webhooks.settings, 'github_webhook_secret', 'secret')
     monkeypatch.setattr(webhooks, 'enqueue', lambda *a: pytest.fail('unauthenticated data reached DB'))
     async with AsyncClient(transport=ASGITransport(app=app), base_url='http://test') as client:
-        response = await client.post('/webhooks/' + source, json={})
+        response = await client.post('/webhooks/github', json={})
+        assert response.status_code == 401
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('query', ['', '?secret=wrong'])
+async def test_jira_query_secret_required_before_database(query, monkeypatch):
+    app = FastAPI(); app.include_router(webhooks.router)
+    monkeypatch.setattr(webhooks.settings, 'jira_webhook_secret', 'secret')
+    monkeypatch.setattr(webhooks, 'enqueue', lambda *a: pytest.fail('unauthenticated data reached DB'))
+    async with AsyncClient(transport=ASGITransport(app=app), base_url='http://test') as client:
+        response = await client.post('/webhooks/jira' + query, json={})
         assert response.status_code == 401
 
 
@@ -57,13 +67,13 @@ async def test_authenticated_delivery_and_comment_semantic_dedupe(db_ticket, mon
     monkeypatch.setattr(webhooks, 'process_delivery', process)
     comment_id = str(uuid.uuid4())
     body = json.dumps({'webhookEvent': 'comment_created', 'issue': {'key': db_ticket[1]}, 'comment': {'id': comment_id}}).encode()
-    headers = {'X-Hub-Signature': 'sha256=' + hmac.new(b'secret', body, hashlib.sha256).hexdigest(),
-               'X-Atlassian-Webhook-Identifier': str(uuid.uuid4())}
     try:
         async with AsyncClient(transport=ASGITransport(app=app), base_url='http://test') as client:
-            assert (await client.post('/webhooks/jira', content=body, headers=headers)).json()['duplicate'] is False
-            headers['X-Atlassian-Webhook-Identifier'] = str(uuid.uuid4())
-            assert (await client.post('/webhooks/jira', content=body, headers=headers)).json()['duplicate'] is True
+            url = '/webhooks/jira?secret=secret&triggeredByUser=true'
+            response = await client.post(url, content=body)
+            assert response.status_code == 200
+            assert response.json()['duplicate'] is False
+            assert (await client.post(url, content=body)).json()['duplicate'] is True
         assert len(calls) == 1
     finally:
         with SessionLocal() as db:
