@@ -10,6 +10,7 @@ ModelTier = Literal["strong", "cheap"]
 
 _STRONG_TASKS = {
     "critic",
+    "code_intelligence",
     "diagnosis",
     "orchestrator",
     "planner",

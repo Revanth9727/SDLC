@@ -10,7 +10,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any, Iterator, Literal, TypeVar
 
-from openai import OpenAI
+from openai import APIConnectionError, APITimeoutError, InternalServerError, OpenAI, RateLimitError
 from pydantic import BaseModel, ValidationError
 
 from app.config import settings
@@ -73,16 +73,65 @@ class LLMClient:
         """Return plain text from OpenAI and record usage for the current ticket."""
         model = self._model_for_tier(tier)
         kwargs: dict[str, Any] = {"response_format": {"type": "json_object"}} if json_mode else {}
-        response = self._client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            **kwargs,
-        )
-        self._record_usage(self._resolve_ticket_id(ticket_id), model, response)
-        return response.choices[0].message.content or ""
+        from app.core.budget import reserve, finish, budget_reason, BudgetExceeded
+        ident = self._resolve_ticket_id(ticket_id)
+        from app.agents import cache
+        cacheable = cache.enabled_for(ident)
+        cache_key = cache.prompt_hash(system, user, tier)
+        material = cache.prompt_material(system, user, tier)
+        prompt_vector = None
+        if cacheable:
+            try:
+                cached = cache.get_exact(cache_key, model)
+                if cached is not None:
+                    cache.note("exact_hits")
+                    return cached
+            except Exception as exc:
+                cache.warning("exact lookup", exc)
+            try:
+                prompt_vector = self.embed(material)
+                cached = cache.get_semantic(
+                    prompt_vector, model,
+                    getattr(settings, "llm_cache_semantic_threshold", 0.92),
+                )
+                if cached is not None:
+                    cache.note("semantic_hits")
+                    return cached
+            except Exception as exc:
+                cache.warning("semantic lookup", exc)
+            cache.note("misses")
+        else:
+            cache.note("bypassed")
+        durable = reserve(ident) if ident else False
+        if not durable and ident:
+            reason = budget_reason(self.get_usage(ident))
+            if reason:
+                raise BudgetExceeded(reason)
+        response = None
+        try:
+            from app.core.retry import with_backoff
+            response = with_backoff(
+                "openai.chat.completions.create",
+                lambda: self._client.chat.completions.create(
+                    model=model, messages=[{'role': 'system', 'content': system},
+                                           {'role': 'user', 'content': user}], **kwargs),
+                (APIConnectionError, APITimeoutError, RateLimitError, InternalServerError),
+            )
+            content = response.choices[0].message.content or ''
+            if cacheable:
+                try:
+                    if prompt_vector is None:
+                        prompt_vector = self.embed(material)
+                    cache.put(cache_key, material, prompt_vector, content, model)
+                except Exception as exc:
+                    cache.warning("write", exc)
+            return content
+        finally:
+            self._record_usage(ident, model, response)
+            if durable:
+                tokens = int(getattr(getattr(response, 'usage', None), 'total_tokens', 0) or 0)
+                rate = self._EST_COST_PER_1K_TOKENS.get(model, settings.llm_est_cost_per_1k_tokens)
+                finish(ident, tokens, tokens / 1000 * rate)
 
     def complete_json(
         self,
@@ -100,7 +149,7 @@ class LLMClient:
         )
         last_error: ValidationError | ValueError | None = None
         prompt = user
-        for attempt in range(2):
+        for attempt in range(settings.max_agent_retries + 1):
             # json_mode asks the API to guarantee valid JSON (no markdown fences
             # or prose); _strip_code_fence is a defensive second layer in case a
             # model/provider ignores that or doesn't support it.
@@ -108,6 +157,11 @@ class LLMClient:
             try:
                 return schema.model_validate_json(self._strip_code_fence(text))
             except (ValidationError, ValueError) as exc:
+                try:
+                    from app.agents.cache import invalidate
+                    invalidate(json_system, prompt, tier, text)
+                except Exception:
+                    pass
                 last_error = exc
                 prompt = (
                     f"{user}\n\nYour previous response did not validate as JSON for "
@@ -115,6 +169,20 @@ class LLMClient:
                     "code fences or commentary."
                 )
         raise last_error  # type: ignore[misc]
+
+    def embed(self, text_to_embed: str) -> list[float]:
+        """Return an embedding vector (memory.md §3/§4 — deterministic, not an
+        agent call; the model is config-pinned, M-5). Routed through this one
+        client like every other OpenAI call (R-18), but not budget-tracked
+        (R-34) — embeddings are a fixed, negligible per-ticket cost, unlike the
+        open-ended reasoning calls that budget guards against."""
+        from app.core.retry import with_backoff
+        response = with_backoff(
+            "openai.embeddings.create",
+            lambda: self._client.embeddings.create(model=settings.openai_embed_model, input=text_to_embed),
+            (APIConnectionError, APITimeoutError, RateLimitError, InternalServerError),
+        )
+        return response.data[0].embedding
 
     @staticmethod
     def _strip_code_fence(text: str) -> str:
@@ -126,6 +194,10 @@ class LLMClient:
 
     @classmethod
     def get_usage(cls, ticket_id: str) -> dict[str, float | int]:
+        from app.core.budget import usage as durable_usage
+        saved = durable_usage(ticket_id)
+        if saved is not None:
+            return {key: saved[key] for key in ("calls", "tokens", "est_cost_usd")}
         usage = cls._usage.get(ticket_id, _Usage())
         return {
             "calls": usage.calls,
@@ -156,7 +228,7 @@ class LLMClient:
             return
         usage_obj = getattr(response, "usage", None)
         total_tokens = int(getattr(usage_obj, "total_tokens", 0) or 0)
-        rate = cls._EST_COST_PER_1K_TOKENS.get(model, 0.0)
+        rate = cls._EST_COST_PER_1K_TOKENS.get(model, settings.llm_est_cost_per_1k_tokens)
         usage = cls._usage[ticket_id]
         usage.calls += 1
         usage.tokens += total_tokens

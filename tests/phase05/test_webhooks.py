@@ -102,14 +102,72 @@ async def test_inbox_recovers_failure_once(db_ticket, monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('author,outcome', [('bot', 'ignored_self'), ('stranger', 'unauthorized')])
-async def test_permission_and_self_filter_precede_llm(monkeypatch, author, outcome):
+@pytest.mark.parametrize('author,posted_by_app,outcome', [
+    ('bot', True, 'ignored_self'),
+    ('stranger', False, 'unauthorized'),
+])
+async def test_permission_and_self_filter_precede_llm(monkeypatch, author, posted_by_app, outcome):
     jira = Jira()
     monkeypatch.setattr(comment_handling, 'context_for', lambda key: {'ticket_id': str(uuid.uuid4())})
-    monitor = SimpleNamespace(run=lambda *args: pytest.fail('LLM should not run'))
+    monkeypatch.setattr(comment_handling, 'is_app_comment', lambda comment_id: posted_by_app)
+    monitor = SimpleNamespace(run=(lambda *args: pytest.fail('app comment reached classifier')) if posted_by_app else
+                              (lambda *args: CommentIntent(intent='CHATTER')))
     result = await comment_handling.handle_comment('TEST-1', {'id': '1', 'author': {'accountId': author}, 'body': 'stop'}, jira, monitor)
     assert result == outcome
     assert bool(jira.comments) == (author == 'stranger')
+
+
+@pytest.mark.asyncio
+async def test_human_sharing_api_account_is_allowed_by_allowlist_and_logs_decisions(monkeypatch, caplog):
+    jira = Jira(); jira.own_account_id = lambda: 'shared-account'
+    ticket_id, gate_id = str(uuid.uuid4()), str(uuid.uuid4())
+    monkeypatch.setattr(comment_handling, 'context_for', lambda key: {'ticket_id': ticket_id})
+    monkeypatch.setattr(comment_handling, 'is_app_comment', lambda comment_id: False)
+    monkeypatch.setattr(comment_handling.settings, 'jira_approval_account_ids', ['shared-account'])
+    monkeypatch.setattr(comment_handling, 'pending_for_ticket', lambda key: [{'id': gate_id}])
+    decisions = []
+    async def decide(gate, decision): decisions.append((gate, decision.approval_status))
+    monkeypatch.setattr(comment_handling, 'decide_registered', decide)
+    caplog.set_level('INFO', logger='app.core.comment_handling')
+    result = await comment_handling.handle_comment('TEST-1', {
+        'id': 'human-comment', 'author': {'accountId': 'shared-account'}, 'body': 'APPROVE'}, jira,
+        SimpleNamespace(run=lambda *args: CommentIntent(intent='APPROVE')))
+    assert result == 'approved'
+    assert decisions == [(gate_id, 'approved')]
+    assert 'authorized=True' in caplog.text
+    assert 'intent=APPROVE' in caplog.text
+    assert 'gate_matched' in caplog.text
+    assert 'action=resumed' in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_unassigned_ticket_with_empty_allowlist_fails_closed_clearly(monkeypatch):
+    jira = Jira()
+    jira.get_issue_detail = lambda key: {'assignee_id': None, 'status_category': 'indeterminate'}
+    monkeypatch.setattr(comment_handling, 'context_for', lambda key: {'ticket_id': str(uuid.uuid4())})
+    monkeypatch.setattr(comment_handling, 'is_app_comment', lambda comment_id: False)
+    monkeypatch.setattr(comment_handling.settings, 'jira_approval_account_ids', [])
+    result = await comment_handling.handle_comment('ANY-42', {
+        'id': 'human-comment', 'author': {'accountId': 'any-human'}, 'body': 'APPROVE'}, jira,
+        SimpleNamespace(run=lambda *args: CommentIntent(intent='APPROVE')))
+    assert result == 'no_authorized_approver'
+    assert jira.comments[-1] == ('No authorized approver configured: assign this Jira ticket or set '
+                                  'JIRA_APPROVAL_ACCOUNT_IDS in the app .env.')
+
+
+def test_all_gate_comment_intents_use_cheap_model_tier():
+    from app.agents.comment_monitor import CommentMonitorAgent
+    class LLM:
+        def __init__(self): self.calls = []
+        def complete_json(self, system, user, schema, **kwargs):
+            self.system = system
+            self.calls.append(kwargs)
+            return schema(intent='APPROVE')
+    llm = LLM()
+    result = CommentMonitorAgent(llm).run('ticket', 'APPROVE', {'state': {'approval_status': 'pending'}})
+    assert result.intent == 'APPROVE'
+    assert llm.calls == [{'tier': 'cheap', 'ticket_id': 'ticket'}]
+    assert all(phrase in llm.system for phrase in ('yes', 'lgtm', 'go ahead', 'ship it', 'do X instead'))
 
 
 @pytest.mark.asyncio
@@ -159,9 +217,44 @@ async def test_jira_decision_uses_registered_shared_gate(monkeypatch, action):
     monkeypatch.setattr(comment_handling, 'pending_for_ticket', lambda key: [{'id': gate_id}])
     async def decide(gate, decision): decisions.append((gate, decision))
     monkeypatch.setattr(comment_handling, 'decide_registered', decide)
-    result = await comment_handling.handle_comment('TEST-1', {'id': '1', 'author': {'accountId': 'owner'}, 'body': action}, jira)
-    assert result == ('approved' if action == 'APPROVE' else 'rejected')
+    intent = CommentIntent(intent=action)
+    result = await comment_handling.handle_comment('TEST-1', {'id': '1', 'author': {'accountId': 'owner'}, 'body': action},
+                                                   jira, SimpleNamespace(run=lambda *args: intent))
+    assert result == ('approved' if action == 'APPROVE' else 'feedback_requested')
     assert decisions[0][0] == gate_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('intent_name', ['REJECT', 'REVISE'])
+async def test_jira_feedback_decision_uses_shared_gate_resume(monkeypatch, intent_name):
+    jira = Jira(); decisions = []
+    ticket_id, gate_id = str(uuid.uuid4()), str(uuid.uuid4())
+    monkeypatch.setattr(comment_handling, 'context_for', lambda key: {'ticket_id': ticket_id})
+    monkeypatch.setattr(comment_handling, 'pending_for_ticket', lambda key: [{'id': gate_id}])
+    async def decide(gate, decision):
+        decisions.append((gate, decision))
+        return {'approval_status': 'pending'}
+    monkeypatch.setattr(comment_handling, 'decide_registered', decide)
+    intent = CommentIntent(intent=intent_name, feedback='Handle None too')
+    result = await comment_handling.handle_comment('TEST-1', {
+        'id': 'feedback', 'author': {'accountId': 'owner'}, 'body': 'reject - handle None'}, jira,
+        SimpleNamespace(run=lambda *args: intent))
+    assert result == 'replanning'
+    assert decisions[0][0] == gate_id
+    assert decisions[0][1] == ApprovalDecision(approval_status='rejected', note='Handle None too')
+
+
+@pytest.mark.asyncio
+async def test_question_answers_without_consuming_pending_gate(monkeypatch):
+    jira = Jira(); ticket_id = str(uuid.uuid4())
+    monkeypatch.setattr(comment_handling, 'context_for', lambda key: {'ticket_id': ticket_id})
+    monkeypatch.setattr(comment_handling, 'pending_for_ticket', lambda key: pytest.fail('question must not consume gate'))
+    intent = CommentIntent(intent='QUESTION', response='The plan changes app.py and its regression test.')
+    result = await comment_handling.handle_comment('TEST-1', {
+        'id': 'question', 'author': {'accountId': 'owner'}, 'body': 'What changes?'}, jira,
+        SimpleNamespace(run=lambda *args: intent))
+    assert result == 'QUESTION'
+    assert jira.comments[-1] == intent.response
 
 
 @pytest.mark.asyncio
@@ -197,7 +290,7 @@ async def test_pr_matrix_merge_reopen_closed_open_and_stale(db_ticket):
     snapshot = {'id': str(uuid.uuid4()), 'number': 1, 'url': 'https://github.com/owner/repo/pull/1',
                 'repo': 'owner/repo', 'branch': 'sdlc/test', 'state': 'open'}
     await pr_sync.sync_pr(key, snapshot.copy(), jira, github)
-    assert jira.statuses == ['in_progress']
+    assert jira.statuses == ['in_review']
     count = len(jira.comments)
     await pr_sync.sync_pr(key, snapshot.copy(), jira, github)
     assert len(jira.comments) == count
@@ -238,7 +331,8 @@ async def test_real_plan_registry_jira_and_ui_share_one_resume(db_ticket, monkey
     ticket_id, key = db_ticket
     sid = str(uuid.uuid4())
     state = SubtaskState(ticket_id=ticket_id, subtask_id=sid, subtask_type='bug', jira_key=key,
-        description='Handle zero', repo='owner/repo', plan=[Step(step_id='1', intent='Guard zero', target_file='app.py')])
+        description='Handle zero', repo='owner/repo', confirmed_repos=['owner/repo'],
+        plan=[Step(step_id='1', intent='Guard zero', target_file='app.py')])
     jira = Jira(); calls = []
     class Diagnosis:
         def run(self, state):
@@ -246,6 +340,12 @@ async def test_real_plan_registry_jira_and_ui_share_one_resume(db_ticket, monkey
             return state
     class Planner:
         def run(self, state): return state
+    class Decomposer:
+        def run(self, state):
+            state.subtask_specs = [{'spec_id': '1', 'type': state.subtask_type, 'description': state.description,
+                                    'repo': state.repo, 'depends_on': []}]
+            state.decomposition_reasoning = 'One clear bug fix.'
+            return state
     class Executor:
         async def run(self, state):
             calls.append('execute')
@@ -256,24 +356,36 @@ async def test_real_plan_registry_jira_and_ui_share_one_resume(db_ticket, monkey
             calls.append('publish')
             return {'id': str(uuid.uuid4()), 'number': 1, 'url': 'https://github.com/owner/repo/pull/1',
                     'state': 'open', 'repo': 'owner/repo', 'branch': 'sdlc/' + sid}
+    class Critic:
+        def run(self, state):
+            calls.append('critic')
+            state.critic_verdict = {'approved': True, 'issues': [], 'verifiability': 'ok'}
+            return state
     factory = graph_module.build_graph
     monkeypatch.setattr(graph_module, 'build_graph', lambda **kwargs: factory(agent=Diagnosis(), planner=Planner(),
-        executor=Executor(), publisher=Publisher(), jira=jira, **kwargs))
+        decomposer=Decomposer(), executor=Executor(), critic=Critic(), publisher=Publisher(), jira=jira,
+        memory_search=lambda *a, **k: [], **kwargs))
     with SessionLocal() as db:
         db.add(Subtask(id=uuid.UUID(sid), ticket_id=uuid.UUID(ticket_id), type='bug', description='test', status='running'))
         db.commit()
     try:
         await graph_module.run_diagnosis_graph(state)
+        # The Planner's intent-confirmation pauses first; confirm it (as the UI
+        # would) so the flow reaches the plan gate this test is actually about.
+        async with graph_module.open_graph(ticket_id, sid, lock=True) as g:
+            await graph_module.resume_approval(g, ticket_id, sid, ApprovalDecision(approval_status='approved'))
         gates = pending_for_ticket(ticket_id)
         assert len(gates) == 1
         gate_id = gates[0]['id']
-        assert any(gate_id in text for text in jira.comments)
+        assert any('Reply approve or reject, or describe a change you want.' in text for text in jira.comments)
+        assert not any(gate_id in text for text in jira.comments)
         result = await comment_handling.handle_comment(key, {'id': 'test-comment', 'author': {'accountId': 'owner'},
-            'body': f'APPROVE {gate_id}'}, jira)
-        assert result == 'approved' and calls == ['execute', 'publish']
+            'body': 'go ahead'}, jira,
+            SimpleNamespace(run=lambda *args: CommentIntent(intent='APPROVE')))
+        assert result == 'approved' and calls == ['execute', 'critic', 'publish']
         await _decide(uuid.UUID(ticket_id), uuid.UUID(sid), ApprovalDecision(approval_status='approved'))
-        assert calls == ['execute', 'publish']
-        assert pending_for_ticket(ticket_id) == []
+        assert calls == ['execute', 'critic', 'publish']
+        assert proposals.get_proposal(gate_id)['status'] == 'APPROVED'
     finally:
         async with AsyncPostgresSaver.from_conn_string(settings.database_url) as saver:
             await saver.adelete_thread(f'{ticket_id}:{sid}')

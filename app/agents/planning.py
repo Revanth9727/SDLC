@@ -71,9 +71,3 @@ class ApprovalDecision(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
     approval_status: Literal["approved", "rejected"]
     note: str = Field(default="", max_length=4000)
-
-    @model_validator(mode="after")
-    def rejection_note(self):
-        if self.approval_status == "rejected" and not self.note:
-            raise ValueError("a rejection requires a note")
-        return self

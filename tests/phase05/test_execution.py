@@ -241,9 +241,9 @@ async def test_no_tests_defers_until_plan_adds_a_test_then_verifies(local_no_tes
             if self.calls == 1:
                 return schema.model_validate({'blocks': [{'search': '    return a / b',
                     'replace': '    if b == 0:\n        raise ValueError("zero denominator")\n    return a / b'}]})
-            return schema.model_validate({'blocks': [{'search': '',
-                'replace': 'from app import divide\nimport pytest\ndef test_zero():\n'
-                           '    with pytest.raises(ValueError):\n        divide(1, 0)\n'}]})
+            return schema.model_validate({'full_content':
+                'from app import divide\nimport pytest\ndef test_zero():\n'
+                '    with pytest.raises(ValueError):\n        divide(1, 0)\n'})
 
     llm = TwoStepLLM()
     agent = ExecutorAgent(llm, tool, emit=no_event)
@@ -273,8 +273,8 @@ async def test_test_step_is_grounded_in_real_source_and_existing_style(local_wit
             self.last_user = user
             # app.py isn't fixed in this fixture (only grounding data is under
             # test here), so assert behavior that already holds.
-            return schema.model_validate({'blocks': [{'search': '',
-                'replace': 'from app import divide\ndef test_ok():\n    assert divide(4, 2) == 2\n'}]})
+            return schema.model_validate({'full_content':
+                'from app import divide\ndef test_ok():\n    assert divide(4, 2) == 2\n'})
 
     llm = CapturingLLM()
     result = await ExecutorAgent(llm, tool, emit=no_event).run(state)
@@ -283,6 +283,38 @@ async def test_test_step_is_grounded_in_real_source_and_existing_style(local_wit
     assert 'def divide' in payload['related_files'].get('app.py', '')  # real source, not just diagnosis prose
     assert payload['style_example']['path'] == 'test_other.py'
     assert 'def test_helper' in payload['style_example']['content']  # an existing test's real convention
+
+
+@pytest.mark.asyncio
+async def test_create_rejects_search_replace_then_writes_full_file(local_with_style_example):
+    tool, state, _ = local_with_style_example
+
+    class CreateLLM:
+        def __init__(self):
+            self.calls, self.prompts = 0, []
+        def get_usage(self, ticket_id):
+            return {'calls': self.calls, 'tokens': self.calls * 10, 'est_cost_usd': 0.0}
+        def complete_json(self, system, user, schema, **kwargs):
+            self.calls += 1
+            self.prompts.append(json.loads(user))
+            content = 'from app import divide\ndef test_ok():\n    assert divide(4, 2) == 2\n'
+            if self.calls == 1:
+                return schema.model_validate({'blocks': [{'search': 'anything', 'replace': content}]})
+            return schema.model_validate({'full_content': content})
+
+    pytest_calls = []
+    def passing(checkout):
+        pytest_calls.append(checkout)
+        return TestResult(passed=True, returncode=0, output='1 passed')
+
+    llm = CreateLLM()
+    result = await ExecutorAgent(llm, tool, test_runner=passing, emit=no_event).run(state)
+    assert result.execution_complete, result.failure_reason
+    assert llm.calls == 2
+    assert len(pytest_calls) == 1
+    assert 'requires full_content, not SEARCH/REPLACE' in llm.prompts[1]['repair_feedback']
+    assert result.steps_done[0]['report']['matches'][0]['tier'] == 'create'
+    assert result.file_changes['test_app.py'].startswith('from app import divide')
 
 
 def test_import_validator_accepts_real_direct_and_qualified_imports(tmp_path):
@@ -323,7 +355,7 @@ async def test_executor_repairs_invalid_test_import_before_pytest(local_with_sty
             self.prompts.append(user)
             content = ('def test_ok():\n    assert divide(4, 2) == 2\n' if self.calls == 1 else
                        'from app import divide\ndef test_ok():\n    assert divide(4, 2) == 2\n')
-            return schema.model_validate({'blocks': [{'search': '', 'replace': content}]})
+            return schema.model_validate({'full_content': content})
 
     pytest_calls = []
     def passing(checkout):
@@ -407,14 +439,27 @@ async def test_full_graph_real_git_and_pytest_idempotent_pr(local, monkeypatch):
     class Planner:
         def run(self, state):
             return state
+    class Decomposer:
+        def run(self, state):
+            state.subtask_specs = [{'spec_id': '1', 'type': state.subtask_type, 'description': state.description,
+                                    'repo': state.repo, 'depends_on': []}]
+            state.decomposition_reasoning = 'One clear bug fix.'
+            return state
+    class ApprovingCritic:
+        def run(self, state):
+            state.critic_verdict = {'approved': True, 'issues': [], 'verifiability': 'ok'}
+            return state
     state.approval_status = 'pending'
+    state.confirmed_repos = [state.repo]
     saver = MemorySaver()
-    graph = module.build_graph(agent=Diagnosis(), planner=Planner(), executor=ExecutorAgent(LLM(), tool, emit=no_event),
-                               publisher=github, checkpointer=saver, activity_check=lambda state: None)
+    graph = module.build_graph(agent=Diagnosis(), planner=Planner(), decomposer=Decomposer(),
+                               executor=ExecutorAgent(LLM(), tool, emit=no_event), memory_search=lambda *a, **k: [],
+                               critic=ApprovingCritic(), publisher=github, checkpointer=saver, activity_check=lambda state: None)
     config = module.thread_config(state.ticket_id, state.subtask_id)
-    await graph.ainvoke(state.model_dump(), config)
-    assert (await graph.aget_state(config)).next == ('human_gate',)
     answer = ApprovalDecision(approval_status='approved')
+    await graph.ainvoke(state.model_dump(), config)
+    await module.resume_approval(graph, state.ticket_id, state.subtask_id, answer)
+    assert (await graph.aget_state(config)).next == ('human_gate',)
     result = await module.resume_approval(graph, state.ticket_id, state.subtask_id, answer)
     assert result.pr_url == 'https://github.com/owner/repo/pull/1', result.failure_reason
     assert result.status == 'in_review'

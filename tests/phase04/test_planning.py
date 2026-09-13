@@ -49,6 +49,18 @@ def test_planner_validates_and_uses_cheap_tier():
     assert 'app.py' in llm.calls[0][0]  # repo_files grounding is passed to the model
 
 
+def test_replanning_receives_human_feedback_and_uses_planner_tier():
+    current = state()
+    current.plan = []
+    current.approval_note = 'Handle None as well'
+    llm = LLM({"plan": [{"step_id": "1", "intent": "Handle zero and None", "target_file": "app.py"}],
+               "reasoning": "Incorporate the requested edge case"})
+    result = StepPlannerAgent(llm, FakeRepoTool(["app.py", "test_app.py"])).run(current)
+    assert result.status == 'running'
+    assert 'Handle None as well' in llm.calls[0][0]
+    assert llm.calls[0][1]['tier'] == 'cheap'
+
+
 def test_planner_requires_a_test_step_for_untested_code_then_accepts_it():
     class TwoPassLLM(LLM):
         def __init__(self):

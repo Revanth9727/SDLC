@@ -37,6 +37,8 @@ class StepPlannerAgent:
                         "repo": state.repo,
                         "diagnosis": diagnosis,
                         "repo_files": repo_files,
+                        "previous_plan": [step.model_dump() for step in state.plan],
+                        "human_feedback": state.approval_note,
                         "repair_feedback": feedback,
                     }),
                     PlanningResult,
@@ -139,4 +141,8 @@ Explain briefly why this plan addresses the root cause in reasoning. Do not
 execute anything. If the diagnosis is insufficient or desired behavior is
 ambiguous, return CannotPlan with a reason and null plan. Otherwise CannotPlan is
 null and plan is a nonempty list. Never invent a plan just to satisfy the schema.
+
+When `human_feedback` is non-empty, this is a bounded re-plan after rejection or a
+revision request. Produce a NEW plan that specifically addresses that feedback,
+using `previous_plan` only as context; do not silently return the rejected plan.
 """

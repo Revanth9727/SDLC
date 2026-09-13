@@ -7,6 +7,16 @@
 > hallucination. This document explains what it is, why it's designed the way it is,
 > the exact data and flow, and the rules it must obey. It is built in its own phase
 > (see `codex_prompts.md`); the core system runs fine without it first.
+>
+> **How this relates to Repository Intelligence (Phase 11, architecture.md §7e).** These
+> are two DIFFERENT persistent layers, easy to confuse:
+> - **Ticket memory (this document)** = *what we learned while fixing problems* —
+>   problem+solution summaries of past resolved sub-tasks, for reuse. Scope: past work.
+> - **Repository intelligence (§7e)** = *what the code IS* — symbols, calls, references,
+>   embeddings, and a knowledge graph of a codebase. Scope: the repository.
+> A ticket can draw on both at once ("I've seen a similar bug before" + "I know how this
+> repo is structured"). Keep them separate: same pgvector infrastructure, different tables
+> and different purpose.
 
 ---
 

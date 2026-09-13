@@ -47,7 +47,7 @@ def test_complete_uses_tier_model_and_tracks_usage(monkeypatch) -> None:
         llm,
         "settings",
         SimpleNamespace(
-            openai_api_key="test",
+            openai_api_key="test", max_agent_retries=2, llm_est_cost_per_1k_tokens=0.01,
             model_strong="strong-model",
             model_cheap="cheap-model",
         ),
@@ -63,7 +63,7 @@ def test_complete_uses_tier_model_and_tracks_usage(monkeypatch) -> None:
     assert LLMClient.get_usage("ticket-1") == {
         "calls": 1,
         "tokens": 100,
-        "est_cost_usd": 0.0,
+        "est_cost_usd": 0.001,
     }
 
 
@@ -72,7 +72,7 @@ def test_complete_json_retries_once_on_validation_error(monkeypatch) -> None:
         llm,
         "settings",
         SimpleNamespace(
-            openai_api_key="test",
+            openai_api_key="test", max_agent_retries=2, llm_est_cost_per_1k_tokens=0.01,
             model_strong="gpt-4o",
             model_cheap="gpt-4o-mini",
         ),
@@ -96,7 +96,7 @@ def test_complete_json_strips_markdown_code_fence(monkeypatch) -> None:
     monkeypatch.setattr(
         llm,
         "settings",
-        SimpleNamespace(openai_api_key="test", model_strong="gpt-4o", model_cheap="gpt-4o-mini"),
+        SimpleNamespace(openai_api_key="test", max_agent_retries=2, llm_est_cost_per_1k_tokens=0.01, model_strong="gpt-4o", model_cheap="gpt-4o-mini"),
     )
     LLMClient.reset_usage()
     fenced = '```json\n{\n  "word": "pong"\n}\n```'

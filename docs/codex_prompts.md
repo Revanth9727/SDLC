@@ -894,6 +894,98 @@ and only acts on authorised users.
 
 ---
 
+# PHASE 5.6 — Status Setup Page (User-Declared Statuses)
+
+Goal: let the user declare the exact Jira statuses their project uses and what each one
+means, and have the whole tool move tickets only among those — while categories (R-25)
+stay underneath as the safety net. Implements R-49. Ticket intake/picking (R-27) is
+unchanged. Build order within the phase: define the status map first (the config page),
+then make the transition points consume it.
+
+## 5.6.1 The status setup page + saved status map
+
+**PROMPT**
+```
+Read agent_context.md and ai_rules.md. Stay strictly in scope for this sub-step.
+Implement R-49's status configuration. General capability — no hardcoded status names.
+
+Add a first-run setup page (a config screen shown before the main app when no status
+map is saved yet; also reachable later from settings). On it:
+- FETCH the project's real statuses + statusCategories from Jira (reuse the existing
+  Jira client; do NOT hardcode). List each status as an editable row.
+- For each status, AUTO-SUGGEST its meaning from its category and name (ready-to-pick-up,
+  work-started, in-review, blocked/needs-human, done), shown in a dropdown the user can
+  correct. Flag any low-confidence guess for the user to confirm.
+- The user can add/remove rows and must be able to save.
+- PERSIST the confirmed map (status name + id + assigned meaning) to the DB as the
+  project's status map. This map — not hardcoded names — becomes the source of truth for
+  every transition the tool performs.
+- Everything is a button/field (R-45); values reflect current saved state.
+
+Do NOT change ticket intake/picking. Do NOT change how categories classify unknown
+statuses — that safety net stays (R-25/R-28). Emit a streamed event when the map is
+saved. End by telling me how to open the setup page, see my real Jira statuses listed
+with suggested meanings, correct one, save, and confirm the map is stored.
+```
+
+**SEE** — a setup page listing YOUR actual Jira statuses, each with a suggested meaning
+you can change; on save, the map is stored and you enter the app.
+
+**TEST** — open the setup page; confirm your real statuses appear; change one meaning;
+save; reopen and confirm it persisted. Confirm the app uses the saved map on next start.
+
+## 5.6.2 Transitions consume the declared map (PR → in-review, comment → status)
+
+**PROMPT**
+```
+Read agent_context.md and ai_rules.md. Stay strictly in scope. Implement R-49's
+transition behaviour on top of the saved status map from 5.6.1. General, no hardcoding.
+
+Make every status transition the tool performs resolve its target in this ORDER —
+map → category → comment-and-leave — not from hardcoded names:
+- FIRST, the SAVED status map (by meaning): use the user's declared status for that
+  meaning.
+- ELSE, fall back to the existing category logic (R-25) to find a target.
+- ELSE (neither the map nor a category yields a reachable status): do NOT force anything
+  and do NOT error — post ONE comment on the ticket ("couldn't move to <meaning> — no
+  matching status") and LEAVE the ticket in its current status. This is the existing
+  non-blocking / unknown-status behaviour (R-11/R-28), reused — not a new code path.
+Apply this to every transition point that exists today (claim → work-started, gate →
+awaiting-approval, approve → work-started, PR open → in-review, escalation → blocked, PR
+merged → done, reopened → work-started). A human COMMAND comment that implies a status
+change must route THROUGH the gate (R-48): the comment triggers the action; the action's
+stage-boundary sets the status via this same map → category → comment-and-leave order. A
+comment NEVER sets status directly.
+Emit a streamed event naming the meaning, which layer resolved it (map / category /
+comment-and-leave), the resolved status (if any), and whether it was applied. End by
+telling me how to watch a PR open move the ticket to my declared in-review status, how it
+falls back to category when I leave that meaning unset, and how it comments-and-leaves
+when neither can resolve a target.
+```
+
+**SEE** — opening a PR moves the ticket to the status YOU declared as "in review." If you
+left that meaning unset, it falls back to a category match. If neither can resolve a
+status, the tool comments on the ticket and leaves it in place.
+
+**TEST**
+- Declare an in-review status; run a ticket to PR → confirm it moves there (resolved via
+  map).
+- Clear the in-review meaning in the map (leave a valid In-Progress-category status
+  present); run to PR → confirm it falls back to category and still moves.
+- Remove any usable target entirely for a meaning; trigger that transition → confirm the
+  tool comments "couldn't move to <meaning>" and leaves the ticket in place (no crash, no
+  silent drop).
+- Comment an authorised command that moves the ticket → confirm it goes through the gate,
+  and the action then sets status via map → category → comment-and-leave (comment didn't
+  set it directly).
+
+**Phase 5.6 done when:** the user declares their statuses + meanings on a setup page; the
+tool moves tickets only among those declared statuses (PR → declared in-review, etc.);
+categories still catch anything undeclared; comments move status only through the gate;
+and the GitHub token is remembered per repo (R-42) with no re-entry.
+
+---
+
 # PHASE 6 — Guards, Failure Exits, Retry Caps
 
 Goal: make Principle A real everywhere — the system fails safely and visibly.
@@ -1375,6 +1467,189 @@ docker compose up -d --build
 **Phase 10 done when:** independent sub-tasks run in parallel, edge cases are
 handled, and the whole system comes up with one command and ingests real Jira
 tickets automatically — production-ready.
+
+---
+
+# PHASE 11 — Code Intelligence (understand large repos before changing them)
+
+Goal: let the tool understand the change and its neighbourhood **on demand** in a large
+repo — find the relevant code, follow how it connects, verify against source — without
+reading blindly or exploding token cost. Implements R-50/R-51 and architecture.md §7e.
+
+**Why here (not earlier).** Same reason memory was late: a knowledge graph + vector search
+on an unproven pipeline is hard to debug, and by now there are real tickets and repos to
+drive lazy indexing. Built progressively — each sub-step is usable on its own, and cost
+drops at every step. **Sequencing note:** this is placed after Phase 10 as its own track;
+if big-repo support becomes urgent, the lexical sub-step (11.1) can be pulled earlier since
+it stands alone. That's a planning decision to confirm, not a fixed order.
+
+**Deterministic-first, always (R-50).** Everything factual — parsing, symbols, edges,
+embeddings, git-diff updates — is deterministic code, NO LLM. Only the ONE investigator
+agent (11.5) reasons. Graph = navigation, code = evidence: always verify against real
+source.
+
+## 11.1 Lexical layer — search tools + follow-the-links
+
+**PROMPT**
+```
+Read agent_context.md and ai_rules.md. Stay strictly in scope. Add deterministic code
+SEARCH tools the agents can call — no LLM in these tools, general for any repo.
+Provide: search_exact (grep/ripgrep over the clone), find_symbol (definition location),
+get_callers / get_callees / get_references (by symbol name, via lexical scan), get_file
+(a slice of a file by path + line range), get_diff (git diff between two commits).
+Wire them so Diagnosis can, for a ticket, resolve search terms from the ticket text, run
+search_exact/find_symbol, and follow callers/callees to read only the relevant files
+instead of the whole repo. Stream each tool call as an event (R-23/R-45). No persistence
+yet, no embeddings, no graph — just fast lexical tools over the existing clone. End by
+telling me how to run a ticket and watch it locate the relevant files by search instead
+of reading everything.
+```
+**SEE** — a ticket's diagnosis shows search/tool events narrowing to a few files.
+**TEST** — on a medium repo, confirm it reads only the shortlisted files, not all of them.
+> Note: lexical callers/callees are the PROTOTYPE. The intended evolution (later) is
+> AST/language-aware symbol resolution (tree-sitter / language server) with lexical
+> fallback — grepping `save()` doesn't prove a call. Don't hardcode assumptions that block
+> that upgrade.
+
+## 11.2 Repository-intelligence service + persistence (deterministic facts)
+
+**PROMPT**
+```
+Read agent_context.md, ai_rules.md, architecture.md §7e. Stay in scope. Add the
+persistent, per-repo repository-intelligence layer (R-50). Deterministic only.
+Model a RepositorySnapshot keyed by repo_id + ref (branch) + commit_sha (index_status,
+indexed_at) — NOT repo+commit alone — plus stores for file inventory, symbols, references,
+SQL reads/writes, and file hashes. Every stored fact carries PROVENANCE: source file +
+line range, extractor name, commit, confidence, PROVEN/INFERRED.
+On first sight of a repo, do a CHEAP cold scan (inventory + languages + symbols + lexical)
+and persist it; embeddings come in 11.3. On a later ticket for a known repo at a new
+commit, UPDATE INCREMENTALLY via git diff (reparse only changed files, update symbols,
+drop stale rows, bump commit_sha) — never a full re-index.
+Required safety:
+- EXCLUSIONS: respect .gitignore + known vendor/generated dirs (node_modules, vendor,
+  dist, build, target, generated, coverage, .git), binary detection, max file size,
+  minified/lock-file detection; per-repo overrides.
+- CONCURRENCY: one index job per repo/ref at a time (a lock or index_jobs table); a second
+  ticket waits for or reuses the running job — never interleaved edge writes.
+- STATES + RECOVERY: index_status in NEW/INDEXING/READY/PARTIAL/STALE/FAILED/UPDATING;
+  build a new snapshot then atomically swap it active (build → validate → swap); a crash
+  leaves PARTIAL/FAILED, never a half-built READY. A ticket must never read a half-updated
+  index.
+Treat config/build/dependency files (pom.xml, package.json, requirements.txt, Dockerfile,
+CI workflows, application.yml) as first-class artifacts (deps, versions, build/test
+commands), not arbitrary text. Access-scope private-repo intelligence; store
+structure/paths only, never secrets. Stream indexing progress. End by telling me how to
+see a repo go cold→warm (first ticket indexes; a later ticket after a commit updates only
+changed files), and how to see two concurrent tickets share one index job.
+```
+**SEE** — first ticket indexes the repo; a later ticket after a commit updates only changed files.
+**TEST** — confirm `indexed_commit_sha` advances and only changed files are re-parsed.
+
+## 11.3 Hybrid retrieval + rerank (semantic, reuse pgvector)
+
+**PROMPT**
+```
+Read agent_context.md, ai_rules.md, architecture.md §7e. Stay in scope. Add semantic
+retrieval over the repo-intelligence layer, reusing pgvector. Deterministic: chunk code
+structurally, embed chunks, store embeddings keyed by repo+ref (with file path + line
+range + provenance), update embeddings incrementally with the git-diff flow from 11.2.
+IMPORTANT — embed ALL searchable code chunks at cold-index time (global semantic
+discoverability). Do NOT make embeddings lazy: in an ugly, badly-named repo you can't grep
+your way to the area you'd need to embed, so lazy embedding is a chicken-and-egg trap.
+(Only deeper graph/inference stays lazy.)
+Add search_semantic (natural-language → similar code chunks) and a candidate-fusion +
+dedupe + RERANK step that combines exact (11.1) and semantic hits into one ranked
+shortlist. The reranker MUST be deterministic — a defined score such as lexical +
+semantic + symbol-match + graph-proximity + file-type relevance, or reciprocal-rank
+fusion — NOT an LLM call. Stream retrieval events. End by telling me how to ask for code
+by MEANING (no exact keyword) and see it find the right code, fused and reranked with the
+grep hits, and confirm the reranker makes no LLM call.
+```
+**SEE** — a meaning-based query ("where is take-home pay calculated") returns the right code.
+**TEST** — confirm hybrid results (exact + semantic) are fused, deduped, and reranked.
+
+## 11.4 Knowledge graph (proven edges) + source verification
+
+**PROMPT**
+```
+Read agent_context.md, ai_rules.md, architecture.md §7e. Stay in scope. Add a per-repo
+knowledge graph of DETERMINISTIC edges only: CALLS, CALLED_BY, IMPORTS, REFERENCES,
+READS/WRITES (incl. SQL tables/columns), CONTAINS. Build from parsing, not from an LLM.
+Provide graph-traversal tools (get_callers/callees/references already exist lexically —
+back them with the graph where available). Update edges incrementally with the git-diff
+flow. Enforce graph = navigation, code = evidence: any traversal result must be verifiable
+against real source, and the tool opens the source before relying on it. Do NOT add
+AI-inferred edges here (those are a later, marked-as-inferred feature). Stream graph
+lookups. End by telling me how to trace a flow (e.g. what writes a given table) and see it
+verified against the actual source lines.
+```
+**SEE** — a relationship query ("how does X eventually write table Y") returns a verified path.
+**TEST** — confirm every edge shown resolves to real source lines (no unverified claims).
+> Design the edge schema to GROW beyond a call graph (EXTENDS, IMPLEMENTS, OVERRIDES,
+> ROUTES_TO/HANDLES, PUBLISHES_TO/CONSUMES_FROM, EXECUTES/INVOKES, USES_CONFIG,
+> DEPENDS_ON, TESTS) — build the core edges first, don't hardcode "call graph only."
+> Acknowledge STATIC BLIND SPOTS (reflection, DI, config-driven class names, generated/
+> stored-proc SQL, plugin wiring): where static parsing can't resolve a link, mark it
+> incomplete and let the investigator return LOW confidence — never present the graph as
+> complete when it isn't.
+
+## 11.5 The Code-Intelligence agent (the investigator)
+
+**PROMPT**
+```
+Read agent_context.md, ai_rules.md, architecture.md §7e. Stay in scope. Add ONE
+Code-Intelligence agent (the 7th agent, R-51) that orchestrates the 11.1–11.4 TOOLS — do
+NOT create separate lexical/embedding/graph/SQL agents. For a ticket it: decides the
+investigation type → runs exact + semantic search → reranks to a shortlist → inspects →
+follows callers/callees/references → forms a hypothesis → VERIFIES against source →
+returns Pydantic-validated output {relevant_files, relevant_functions, execution_path,
+confidence}. WRITE this result to the blackboard as the `code_context` field (R-1: the
+blackboard is the only channel to Diagnosis — no side path), and include the
+`repo_snapshot_id` + commit_sha it was built on so freshness (R-20) can check it later.
+It FEEDS Diagnosis (Diagnosis reasons about the fix from this slice, no longer reading the
+repo blindly). Bound the investigation loop (R-8: hard cap on steps, then
+return best hypothesis at lower confidence — honest exit R-10); run it under the guard
+(R-9); respect the per-ticket budget (R-34). Surface its verdict + confidence in the UI.
+End by telling me how to run a hard, multi-file ticket and watch the investigator locate a
+root cause in a file whose name doesn't obviously match, with a visible confidence and
+verified evidence.
+```
+**SEE** — a UI panel shows the investigator's shortlist, execution path, and confidence, feeding Diagnosis.
+**TEST**
+- A ticket whose bug lives in a non-obvious file → the agent still finds it by following links.
+- Force a hard case (no clear keyword) → it uses semantic + graph, and verifies before returning.
+- Confirm it stops at the step cap with an honest low-confidence result rather than looping.
+
+## 11.6 Share the brain across the flow (Executor / Critic / integration)
+
+**PROMPT**
+```
+Read agent_context.md, ai_rules.md (R-51), architecture.md §7e. Stay in scope. Make the
+code-intelligence TOOLS available to the existing agents, not just Diagnosis — so Phase 11
+is a shared brain, not a Diagnosis-only add-on. No new agents.
+- EXECUTOR: before applying a surgical edit to a symbol, call get_callers/get_references on
+  it; if the edit would affect callers not covered by the plan, surface that (a warning
+  event / flag for the Critic), don't silently break them.
+- CRITIC: when validating, allow a check for missed callers/references on changed symbols
+  via the graph, and factor it into the verdict.
+- INTEGRATION STAGE: implement the cross-sub-task breakage check using the shared
+  graph/reference tools (does sub-task A's change touch something sub-task B relies on?),
+  rather than a separate ad-hoc mechanism.
+All via the existing blackboard, under the guard and per-ticket budget (R-9/R-34). Keep
+each usage bounded. End by telling me how to see the Executor flag an edit that would break
+a caller, and how the integration stage flags a cross-sub-task break using the graph.
+```
+**SEE** — the Executor warns when an edit would hit an uncovered caller; integration flags a cross-sub-task break via the graph.
+**TEST** — an edit that changes a widely-called symbol surfaces the callers; two sub-tasks where one breaks the other's dependency is caught at integration.
+
+**Phase 11 done when:** on a large repo, a ticket is solved by first finding + verifying
+the relevant slice (lexical → hybrid → graph, deterministic) via one bounded investigator
+agent that feeds Diagnosis — with repo intelligence persisted per-repo and updated
+incrementally, so repeat tickets are cheap — AND the same tools are shared by Executor
+(caller checks before edits), Critic (missed-caller checks), and the integration stage
+(cross-sub-task breakage), so Phase 11 is the existing flow gaining one shared brain rather
+than a Diagnosis-only add-on. Heavier code-intelligence-product features (impact analysis, data lineage, branch-diff graphs, AI-inferred edges, confidence
+dashboards) are deferred beyond this base layer.
 
 ---
 

@@ -98,6 +98,8 @@ def test_fetch_project_statuses_returns_category_map(monkeypatch) -> None:
 
 
 def test_set_status_picks_target_category_without_name_mapping(monkeypatch) -> None:
+    monkeypatch.setattr("app.core.status_map.load_map", lambda project: None)
+    monkeypatch.setattr("app.core.status_events.emit_transition", lambda *args: None)
     monkeypatch.setattr(
         jira_tool,
         "settings",

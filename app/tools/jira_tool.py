@@ -5,6 +5,7 @@ its input and output (R-7).
 """
 
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, NotRequired, TypedDict
 
@@ -13,6 +14,30 @@ import httpx
 from app.config import settings
 
 logger = logging.getLogger(__name__)
+
+
+class _RetryClient(httpx.Client):
+    """Retry transient Jira transport failures and retryable HTTP responses."""
+
+    def request(self, method, url, *args, **kwargs):
+        attempts = settings.external_retry_attempts
+        for attempt in range(1, attempts + 1):
+            try:
+                response = super().request(method, url, *args, **kwargs)
+                if response.status_code not in (429, 500, 502, 503, 504):
+                    return response
+                if attempt == attempts:
+                    return response
+                response.close()
+            except (httpx.TimeoutException, httpx.NetworkError):
+                if attempt == attempts:
+                    raise
+            delay = settings.external_retry_base_seconds * (2 ** (attempt - 1))
+            logger.warning("jira_request_retry", extra={
+                "operation": f"{method} {url}", "attempt": attempt, "delay_seconds": delay,
+            })
+            time.sleep(delay)
+        raise RuntimeError("Jira request exhausted retries")
 
 _JQL_OPEN = "project = {project_key} AND statusCategory != Done ORDER BY created DESC"
 _CATEGORY_NEW = "new"
@@ -34,6 +59,7 @@ class JiraTransition(TypedDict):
     id: str
     name: str  # destination status name, e.g. "In Progress"
     transition_name: str  # Jira workflow transition label, e.g. "Start progress"
+    status_id: NotRequired[str]  # destination ID (distinct from transition ID)
     category: str | None  # destination statusCategory.key
 
 
@@ -87,7 +113,7 @@ class JiraTool:
         }
 
     def _client(self, timeout_seconds: float | None = None) -> httpx.Client:
-        return httpx.Client(
+        return _RetryClient(
             base_url=self._base,
             auth=self._auth,
             headers=self._headers,
@@ -324,7 +350,7 @@ class JiraTool:
             resp = client.get(f"/rest/api/3/issue/{key}/comment",
                               params={"maxResults": limit, "orderBy": "-created"})
             resp.raise_for_status()
-        own_id = self.own_account_id()
+        from app.core.jira_comments import is_app_comment
         thread = []
         for item in resp.json().get("comments", []):
             body = self.extract_plain_text(item.get("body")).strip()
@@ -333,7 +359,7 @@ class JiraTool:
             author = item.get("author") or {}
             thread.append({
                 "id": item.get("id"),
-                "from_tool": author.get("accountId") == own_id,
+                "from_tool": is_app_comment(str(item.get("id") or "")),
                 "author": author.get("displayName", "unknown"),
                 "body": body[:1000],
                 "created": item.get("created"),
@@ -419,6 +445,7 @@ class JiraTool:
         transitions = [
             JiraTransition(
                 id=t["id"],
+                status_id=str(t["to"].get("id", "")),
                 name=t["to"]["name"],
                 transition_name=t.get("name", ""),
                 category=(t.get("to", {}).get("statusCategory") or {}).get("key"),
@@ -428,122 +455,81 @@ class JiraTool:
         logger.info("jira.get_transitions key=%r -> %r", key, transitions)
         return transitions
 
-    def set_status(self, key: str, internal_stage: str) -> dict[str, Any]:
-        try:
-            return self._set_status(key, internal_stage)
-        except Exception:
-            logger.warning('jira.set_status unavailable key=%r stage=%r', key, internal_stage)
-            return {'applied': False, 'from': '', 'to': None, 'reason': 'Jira status transition unavailable'}
-
-    def _set_status(self, key: str, internal_stage: str) -> dict[str, Any]:
-        """Transition a Jira issue to the status mapped from ``internal_stage``.
-
-        Never raises — if no matching transition is found, logs a warning and
-        returns applied=False (R-11).
-
-        Args:
-            key: Jira issue key, e.g. "AGT-1".
-            internal_stage: One of "in_progress", "awaiting_approval",
-                "in_review", "blocked", "done".
-        """
-        # 1. Resolve the target category and optional preferred status name.
-        attr = _STAGE_MAP.get(internal_stage)
-        target_category = _STAGE_CATEGORY_MAP.get(internal_stage)
-        if not attr or not target_category:
-            reason = f"unknown internal_stage {internal_stage!r}; must be one of {list(_STAGE_MAP)}"
-            logger.warning("jira.set_status SKIPPED key=%r stage=%r reason=%r", key, internal_stage, reason)
-            return {"applied": False, "from": "", "to": None, "reason": reason}
-
-        preferred_name: str = getattr(settings, attr, "").strip()
-
-        # Snapshot current status before the transition attempt.
-        current_status = self.get_issue(key)["status"]
-
-        # 2. Fetch allowed transitions from the issue's CURRENT state.
-        transitions = self.get_transitions(key)
-        logger.info(
-            "jira.set_status MATCH_CHECK key=%r stage=%r target_category=%r preferred=%r current=%r transitions=%r",
-            key,
-            internal_stage,
-            target_category,
-            preferred_name,
-            current_status,
-            transitions,
-        )
-
-        transition_id: str | None = None
-        desired_name: str | None = None
-
-        # 3a. Prefer configured name only when it targets the desired category.
-        if preferred_name:
-            preferred = next(
-                (t for t in transitions if t["name"].lower() == preferred_name.lower()),
-                None,
-            )
-            if preferred and preferred.get("category") == target_category:
-                transition_id = preferred["id"]
-                desired_name = preferred["name"]
-
-        # 3b. Try configured fallback name when present.
-        if transition_id is None:
-            fallback_name = settings.jira_status_fallbacks.get(internal_stage, "").strip()
-            if fallback_name:
-                fallback = next(
-                    (t for t in transitions if t["name"].lower() == fallback_name.lower()),
-                    None,
-                )
-                if fallback and fallback.get("category") == target_category:
-                    transition_id = fallback["id"]
-                    desired_name = fallback["name"]
-
-        # 3c. Category-first default: pick any allowed transition into target category.
-        if transition_id is None:
-            category_match = next(
-                (t for t in transitions if t.get("category") == target_category),
-                None,
-            )
-            if category_match:
-                transition_id = category_match["id"]
-                desired_name = category_match["name"]
-
-        logger.info(
-            "jira.set_status MATCH_RESULT key=%r stage=%r target_category=%r desired=%r matched=%s transition_id=%r",
-            key,
-            internal_stage,
-            target_category,
-            desired_name,
-            bool(transition_id),
-            transition_id,
-        )
-
-        if transition_id is None:
-            available = [(t["name"], t.get("category")) for t in transitions]
-            reason = (
-                f"no matching transition for category {target_category!r}; "
-                f"preferred={preferred_name!r}; available={available}"
-            )
-            logger.warning(
-                "jira.set_status SKIPPED key=%r stage=%r reason=%r",
-                key, internal_stage, reason,
-            )
-            return {"applied": False, "from": current_status, "to": None, "reason": reason}
-
-        # 4. POST the transition.
-        logger.info(
-            "jira.set_status APPLYING key=%r stage=%r transition_id=%r name=%r category=%r",
-            key, internal_stage, transition_id, desired_name, target_category,
-        )
+    def project_status_rows(self) -> list[dict]:
+        """Real project statuses, including stable IDs; no global-status fallback."""
         with self._client() as client:
-            resp = client.post(
-                f"/rest/api/3/issue/{key}/transitions",
-                json={"transition": {"id": transition_id}},
-            )
-            resp.raise_for_status()
-        logger.info(
-            "jira.set_status APPLIED key=%r from=%r to=%r",
-            key, current_status, desired_name,
-        )
-        return {"applied": True, "from": current_status, "to": desired_name, "reason": None}
+            response = client.get(f"/rest/api/3/project/{self._project}/statuses")
+            response.raise_for_status()
+        rows = {}
+        for issue_type in response.json():
+            for status in issue_type.get('statuses', []):
+                rows[str(status['id'])] = {
+                    'id': str(status['id']), 'name': status['name'],
+                    'category': (status.get('statusCategory') or {}).get('key'),
+                }
+        logger.info('jira.project_status_rows project=%r statuses=%r', self._project, list(rows.values()))
+        return list(rows.values())
+
+    def set_status(self, key: str, internal_stage: str) -> dict[str, Any]:
+        from app.core.status_map import STAGE_MEANING
+        from app.core.status_events import emit_transition
+        result = {'applied': False, 'from': '', 'to': None, 'reason': None,
+                  'meaning': STAGE_MEANING.get(internal_stage, internal_stage), 'layer': 'comment-and-leave'}
+        try:
+            self._resolve_status(key, internal_stage, result)
+        except Exception:
+            logger.warning('jira.set_status unavailable key=%r stage=%r', key, internal_stage, exc_info=True)
+            result['reason'] = 'Jira status transition unavailable; ticket left unchanged'
+        if result['reason']:
+            logger.warning('jira.set_status key=%r result=%r', key, result)
+        emit_transition(key, result)
+        return result
+
+    def _resolve_status(self, key: str, stage: str, result: dict) -> None:
+        from app.core.status_map import load_map
+        category = _STAGE_CATEGORY_MAP.get(stage, 'new' if stage == 'ready' else None)
+        if category is None:
+            result['reason'] = 'Unknown transition meaning'
+            return
+        # A failed map read must not silently override a user's declared destination.
+        mapping = load_map(self._project)
+        declared = [row for row in mapping.rows if row.meaning == result['meaning']] if mapping else []
+        issue = self.get_issue(key)
+        result['from'] = issue['status']
+        current_id = str(((issue.get('raw_fields') or {}).get('status') or {}).get('id', ''))
+        transitions = self.get_transitions(key)
+        target = None
+        if declared:
+            result['layer'] = 'map'
+            if any(row.id == current_id or (not current_id and row.name == issue['status']) for row in declared):
+                result.update(to=issue['status'], reason='Already at declared status')
+                return
+            target = next((t for row in declared for t in transitions
+                           if t.get('status_id') == row.id), None)
+            if target is None:
+                result['reason'] = 'Declared status is not reachable; ticket left unchanged'
+                return
+        else:
+            result['layer'] = 'category'
+            preferred = getattr(settings, _STAGE_MAP.get(stage, ''), '')
+            fallback = settings.jira_status_fallbacks.get(stage, '')
+            candidates = [t for t in transitions if t.get('category') == category]
+            target = next((t for name in (preferred, fallback) if name
+                           for t in candidates if t['name'].casefold() == name.casefold()), None)
+            target = target or next(iter(candidates), None)
+        if target is None:
+            result['layer'] = 'comment-and-leave'
+            result['reason'] = f"couldn't move to {result['meaning']} — no matching status"
+            try:
+                self.comment(key, result['reason'])
+            except Exception:
+                result['reason'] += '; Jira comment could not be posted'
+            return
+        result['to'] = target['name']
+        with self._client() as client:
+            response = client.post(f'/rest/api/3/issue/{key}/transitions', json={'transition': {'id': target['id']}})
+            response.raise_for_status()
+        result['applied'] = True
 
     def get_issue_detail(self, key: str) -> JiraIssueDetail:
         """Fetch a single issue with full fields plus reconcile metadata."""
@@ -743,8 +729,16 @@ class JiraTool:
         with self._client() as client:
             resp = client.post(f"/rest/api/3/issue/{key}/comment", json=payload)
             resp.raise_for_status()
-        logger.info("jira.comment -> posted to %r", key)
-        return str(resp.json()["id"])
+        comment_id = str(resp.json()["id"])
+        try:
+            from app.core.jira_comments import record_app_comment
+            record_app_comment(comment_id, key)
+        except Exception:
+            # The Jira write already succeeded. Do not retry and duplicate it;
+            # surface the marker failure while preserving the real comment ID.
+            logger.exception("jira.comment marker_failed key=%r comment_id=%r", key, comment_id)
+        logger.info("jira.comment -> posted key=%r comment_id=%r", key, comment_id)
+        return comment_id
 
 
     def own_account_id(self) -> str:

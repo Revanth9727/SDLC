@@ -29,20 +29,26 @@ nothing is ever lost.
 - Validation: **Pydantic** everywhere on handoffs
 - Tests: **pytest**, per phase, under `tests/phaseNN/`
 
-## The 6 agents (reason with an LLM)
+## The 7 agents (reason with an LLM)
 
 1. **Planner** — ticket → isolated sub-tasks + dependency graph (only thing that sees all sub-tasks)
 2. **Step-Planner** — one sub-task → ordered coding steps
 3. **Orchestrator** — schedules sub-tasks, runs gates, manages flow + PR strategy
-4. **Diagnosis** — reads repo, finds root cause for one sub-task
+4. **Diagnosis** — finds root cause for one sub-task (works from the slice the Code-Intelligence agent supplies)
 5. **Executor** — applies approved steps as surgical edits, runs tests
 6. **Critic** — validates result vs. the ticket before PR
+7. **Code-Intelligence** — *investigator* (Phase 11): given a ticket, finds the relevant code and how it connects (search → rerank → follow callers/callees → verify against source) and feeds Diagnosis. Reasons; the search/graph capabilities are TOOLS, not agents (R-51). Bounded + guarded + budget-capped.
 
 ## NOT agents (deterministic code — no LLM)
 
 Jira I/O (incl. **dynamic status sync**) · GitHub ops · test runner · edit applier
-(SEARCH/REPLACE cascade) · memory similarity search · the guard. (Only exception:
-memory may make ONE LLM call to summarise a resolution for storage.)
+(SEARCH/REPLACE cascade) · memory similarity search · the guard · **repository-intelligence
+service + its tools** (AST parse, symbol/reference extraction, SQL read/write detection,
+embeddings, git-diff incremental update, graph edges, `search_exact`, `search_semantic`,
+`find_symbol`, `get_callers/callees/references`, `get_reads_writes`, `get_file`,
+`get_diff`). (Only exceptions: memory may make ONE LLM call to summarise a resolution for
+storage; the Code-Intelligence *agent* reasons, but every capability it calls is a
+deterministic tool.)
 
 ## Jira status sync (R-25)
 
@@ -52,10 +58,17 @@ tool: `in_progress` (work starts) → `awaiting_approval` (human gate) → `in_r
 matched by name from config; a missing status is skipped with a warning, never blocks
 work. Never hardcode status names/IDs.
 
+**User-declared statuses (R-49, Phase 5.6):** on first run a setup page lets the user
+list their project's actual statuses and assign each a meaning (ready / work-started /
+in-review / blocked / done). The tool moves tickets ONLY among these declared statuses;
+categories (R-25) stay underneath as the safety net (auto-suggest the meaning, catch any
+undeclared status, escalate on truly unknown). A comment moves status only through the
+gate (R-48), never directly. GitHub token saved encrypted per repo (R-42) — no re-entry.
+
 ## The flow
 
 ```
-Jira (poll every N min, claim only "To Do") → [RESOLVE REPOS: cascade + confirm gate]
+Jira (poll every N min, claim only category=new / "To Do") → [RESOLVE REPOS: cascade + confirm gate]
   → PLANNER → sub-tasks → ORCHESTRATOR picks one
   → per sub-task (ISOLATED state, scoped to ONE repo):
        DIAGNOSIS → STEP-PLANNER → HUMAN GATE (pause) → EXECUTOR → CRITIC → [PR] → [memory write-back]
@@ -108,9 +121,45 @@ before work starts. The Planner assigns each sub-task its repo during decomposit
 ## The blackboard (one per sub-task = isolation boundary)
 
 `SubTaskState`: ticket_id, subtask_id, subtask_type, **repo (owner/repo)**,
-depends_on, diagnosis, plan, current_step, steps_done, approval_status, retry_count,
+depends_on, **code_context** (Code-Intelligence output: relevant_files, relevant_symbols,
+relevant_chunks, execution_paths, evidence, confidence, repo_snapshot_id — the ONLY
+channel Code-Intel → Diagnosis, per R-1), diagnosis, plan, current_step, steps_done,
+**repo_snapshot_id + diagnosed_commit_sha** (freshness), approval_status, retry_count,
 budget_used, status, failure_reason, pr_url, memory_refs. Agents read/write named
 fields only.
+
+## Three storage layers (keep them separate)
+
+1. **Blackboard (`SubTaskState`)** — temporary per-sub-task working state. Lifetime: the
+   ticket. Scope: one sub-task (isolation boundary). Above.
+2. **Ticket memory (`subtask_memory`)** — permanent problem+solution summaries for reuse.
+   Lifetime: permanent. Scope: past resolved work. See memory.md.
+3. **Repository intelligence (Phase 11, R-50)** — persistent understanding of a *codebase*
+   (files, symbols, calls/imports/refs, SQL, embeddings, knowledge graph, indexed commit).
+   Lifetime: persistent, per repo. Scope: the repository. Built deterministically, updated
+   incrementally by git diff, grown lazily (cold→warm→hot). Shared read-only across
+   tickets WITHOUT breaking isolation, because it's derived from the shared source, not
+   any ticket's private state; access-scoped for private repos; stores structure, never
+   secrets. The full ticket comment thread is also retained as durable per-ticket history
+   (R-52).
+
+## Code intelligence (Phase 11, R-50/R-51)
+
+To fix code in a big repo without reading it blindly, the tool understands the change and
+its neighbourhood ON DEMAND: a deterministic **repo-intelligence service** stores the
+facts; ONE **Code-Intelligence agent** (7th agent, investigator) drives deterministic
+tools (exact + semantic search → rerank → follow callers/callees → verify against source)
+to return the relevant slice + execution path, which it feeds to Diagnosis. Retrieval
+order is lexical (grep) → hybrid (semantic) → graph traversal, always verified against
+real source (graph = navigation, code = evidence). Embeddings are built for ALL searchable
+chunks at cold-index (global discoverability — not lazy); only deeper graph/inference is
+lazy. Facts carry provenance (source, lines, extractor, commit, confidence); indexing is
+per repo+ref, exclusion-filtered, single-job-per-repo, state-tracked with atomic swap.
+Built as its own track after the spine (8–10) is proven, because a graph on an unproven
+pipeline is hard to debug. **It's a shared brain, not a separate tool:** the same tools
+serve Diagnosis (primary, via `code_context`), Executor (check callers before an edit),
+Critic (missed-caller checks), and the integration stage (cross-sub-task breakage) — all
+through the existing blackboard, guard, and budget.
 
 ## The 10 rules that matter most (full set in ai_rules.md)
 
@@ -118,7 +167,7 @@ fields only.
 2. Every handoff is Pydantic-validated (R-2)
 3. LLM reasons; tools act — model never touches files/git/APIs directly (R-5, R-6)
 4. Every loop has max-N and a human exit; never unbounded (R-8)
-5. A deterministic guard runs after every agent (schema → retry → budget → honest-fail) (R-9)
+5. A deterministic guard runs after every agent (schema → budget → honest-fail → retry) (R-9)
 6. Agents can say "I can't" — never fabricate when cornered (R-10)
 7. Persist state after every node; resume after crash/restart (R-12)
 8. Edits are SEARCH/REPLACE, exactly-one-match, guarded, reversible, bottom-up (R-14–R-16)
@@ -157,15 +206,21 @@ lever after reuse. Quality bar = spec completeness (Critic backstops thin specs)
 guard pauses + asks on exceed. (4) Structural: merge cheap steps, slice context, cache
 prompt prefixes.
 
-**Async (R-35):** all external I/O (Jira/GitHub/OpenAI/DB) is async so the supervisor
-handles tickets concurrently without blocking — Python, no Go. Build from Phase 2.5 on.
+**Async (R-35):** the *goal* is non-blocking external I/O (Jira/GitHub/OpenAI/DB) so the
+supervisor handles tickets concurrently. **Reality (1–10 audit): PARTIAL** — DB is sync
+SQLAlchemy, some HTTP is sync, `to_thread` offloading is inconsistent. Independent
+sub-tasks do run concurrently (`asyncio.gather`). Finishing true async I/O is remaining
+Phase 10 hardening — Python, no Go.
 **LLM cache (R-36):** exact (hash) + semantic (pgvector ≥0.92) cache inside the Python
 LLM client, same Postgres — no separate service, no Go gateway. Built in Phase 9 (needs
 agent traffic to cache).
 
 - Build in the phase order from `codex_prompts.md`. **Do not build ahead.**
 - Deferred (do NOT build until its phase): parallel sub-tasks, full memory layer,
-  AST config edits, large-file scripting, multi-user/auth, context compaction, MCP/A2A.
+  AST config edits, large-file scripting, multi-user/auth, MCP/A2A. Code understanding
+  for large repos (retrieval, symbols, knowledge graph, code slicing) is **Phase 11**
+  (code intelligence), not the old "someday" list. Trajectory/context compaction for long
+  agent histories remains deferred (distinct from code slicing).
 - **Every phase must end with something visible in the UI AND a passing test.**
   If a prompt's result can't be seen or tested, stop and fix the approach.
 

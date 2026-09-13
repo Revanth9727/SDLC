@@ -170,7 +170,7 @@ def prepare_subtask(
 
 
 def cleanup_active_subtask_pile() -> int:
-    """Close all but the newest active attempt per ticket, then enforce R-43."""
+    """Close duplicate legacy attempts while preserving parallel work children."""
     cleaned = 0
     with SessionLocal() as db:
         ticket_ids = list(
@@ -181,7 +181,7 @@ def cleanup_active_subtask_pile() -> int:
             )
         )
         for ticket_id in ticket_ids:
-            active = list(
+            active = [row for row in
                 db.scalars(
                     select(Subtask)
                     .where(
@@ -189,17 +189,13 @@ def cleanup_active_subtask_pile() -> int:
                         Subtask.status.in_(ACTIVE_SUBTASK_STATUSES),
                     )
                     .order_by(Subtask.created_at.desc(), Subtask.id.desc())
-                )
-            )
+                ) if (row.state or {}).get("orchestration_role") != "work"]
             for old in active[1:]:
                 old.status = "superseded"
                 cleaned += 1
         db.commit()
     with engine.begin() as connection:
-        connection.execute(text(
-            "CREATE UNIQUE INDEX IF NOT EXISTS uq_subtasks_one_active_per_ticket "
-            "ON subtasks (ticket_id) WHERE status IN ('running', 'waiting', 'pending')"
-        ))
+        connection.execute(text("DROP INDEX IF EXISTS uq_subtasks_one_active_per_ticket"))
     return cleaned
 
 

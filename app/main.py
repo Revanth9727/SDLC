@@ -5,8 +5,10 @@ Run with:
 """
 
 import asyncio
+import base64
 import json
 import logging
+import secrets
 from contextlib import asynccontextmanager
 from pathlib import Path
 from uuid import UUID
@@ -24,6 +26,7 @@ from app.core.ownership import owner_of_key
 from app.core.poller import poll_cycle, start_loop
 from app.core.steps import post_step
 from app.core.subtasks import cleanup_active_subtask_pile, prepare_subtask
+from app.core.approvals import cleanup_pending_gate_pile
 from app.core.failures import describe_failure
 from app.orchestrator.graph import run_diagnosis_graph
 from app.db.connection import SessionLocal
@@ -34,6 +37,10 @@ from app.tools.repo_tokens import RepoTokenStore
 from app.tools.repo_tool import RepoAccessRequired, RepoTool
 from app.tools.repo_resolver import resolve_repos
 from app.web.approval import router as approval_router, persist_state
+from app.config import settings
+from app.logging_config import configure_logging
+
+configure_logging(settings.log_level)
 
 logger = logging.getLogger(__name__)
 
@@ -53,13 +60,36 @@ async def lifespan(app: FastAPI):
     cleaned = await asyncio.to_thread(cleanup_active_subtask_pile)
     if cleaned:
         logger.info("startup: superseded %d duplicate active subtask(s)", cleaned)
-    from app.db.models import WebhookDelivery, PRLink, PendingApproval
+    from app.db.models import (ExactCache, PendingApproval, PRLink, ProjectStatusMap,
+                               SemanticCache, SubtaskMemory, TicketBudget, WebhookDelivery)
     from app.db.connection import engine
-    for table in (WebhookDelivery.__table__, PRLink.__table__, PendingApproval.__table__):
+    from app.core import status_events
+    status_events.loop = asyncio.get_running_loop()
+    for table in (TicketBudget.__table__, ProjectStatusMap.__table__, WebhookDelivery.__table__, PRLink.__table__,
+                  PendingApproval.__table__, SubtaskMemory.__table__, ExactCache.__table__, SemanticCache.__table__):
         await asyncio.to_thread(table.create, engine, checkfirst=True)
+    from app.db.init_db import ensure_llm_cache_schema, ensure_memory_schema
+    await asyncio.to_thread(ensure_memory_schema)
+    await asyncio.to_thread(ensure_llm_cache_schema)
+    cleaned_gates = await asyncio.to_thread(cleanup_pending_gate_pile)
+    if cleaned_gates:
+        logger.info("startup: expired %d duplicate pending approval gate(s)", cleaned_gates)
+    def ensure_one_gate_index():
+        with engine.begin() as connection:
+            connection.exec_driver_sql("DROP INDEX IF EXISTS uq_pending_approvals_one_per_ticket")
+            connection.exec_driver_sql("DROP INDEX IF EXISTS uq_subtasks_one_active_per_ticket")
+            connection.exec_driver_sql(
+                "ALTER TABLE ticket_budgets ADD COLUMN IF NOT EXISTS started_at "
+                "TIMESTAMPTZ NOT NULL DEFAULT now()"
+            )
+            connection.exec_driver_sql(
+                "ALTER TABLE pending_approvals ADD COLUMN IF NOT EXISTS reminded_at TIMESTAMPTZ"
+            )
+    await asyncio.to_thread(ensure_one_gate_index)
     from app.core.webhook_processing import recover_deliveries
     recovery = asyncio.create_task(recover_deliveries())
     task = await start_loop(_broadcast)
+    app.state.poller_task = task
     yield
     recovery.cancel()
     task.cancel()
@@ -67,7 +97,34 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Agentic SDLC", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def operator_basic_auth(request: Request, call_next):
+    """Protect the operator surface; webhooks retain their service-specific auth."""
+    public = request.url.path == "/health" or request.url.path.startswith("/webhooks/")
+    username, password = settings.ui_basic_auth_username, settings.ui_basic_auth_password
+    if public or not (username and password):
+        return await call_next(request)
+    header = request.headers.get("Authorization", "")
+    supplied_user = supplied_password = ""
+    if header.startswith("Basic "):
+        try:
+            supplied_user, supplied_password = base64.b64decode(header[6:]).decode().split(":", 1)
+        except (ValueError, UnicodeDecodeError):
+            pass
+    if not (secrets.compare_digest(supplied_user, username)
+            and secrets.compare_digest(supplied_password, password)):
+        return JSONResponse(
+            {"detail": "Operator authentication required"}, status_code=401,
+            headers={"WWW-Authenticate": 'Basic realm="Agentic SDLC"'},
+        )
+    return await call_next(request)
 app.include_router(approval_router)
+from app.web.status_setup import router as status_setup_router
+app.include_router(status_setup_router)
+from app.web.escalations import router as escalations_router
+app.include_router(escalations_router)
 from app.web.webhooks import router as webhook_router
 app.include_router(webhook_router)
 
@@ -80,13 +137,56 @@ app.mount(
 templates = Jinja2Templates(directory=_BASE / "web" / "templates")
 
 
+@app.get("/health", response_class=JSONResponse)
+def health(request: Request) -> JSONResponse:
+    from sqlalchemy import text
+    database = "ok"
+    try:
+        with SessionLocal() as db:
+            db.execute(text("SELECT 1"))
+    except Exception:
+        database = "unavailable"
+        logger.exception("health_database_unavailable")
+    poller = getattr(request.app.state, "poller_task", None)
+    poller_state = "running" if poller is not None and not poller.done() else "stopped"
+    healthy = database == "ok" and poller_state == "running"
+    return JSONResponse(
+        {"status": "ok" if healthy else "degraded", "database": database, "poller": poller_state},
+        status_code=200 if healthy else 503,
+    )
+
+
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request) -> HTMLResponse:
+    from app.core.status_map import load_map
+    from app.config import settings
+    if load_map(settings.jira_project_key) is None:
+        return RedirectResponse("/settings/statuses", status_code=303)
     with SessionLocal() as db:
         tickets = db.query(Ticket).order_by(Ticket.created_at.desc()).all()
+    from app.agents.cache import cache_stats
     return templates.TemplateResponse(
-        "index.html", {"request": request, "tickets": tickets}
+        "index.html", {"request": request, "tickets": tickets, "cache_stats": cache_stats()}
     )
+
+
+@app.get("/debug/llm/cache", response_class=JSONResponse)
+def llm_cache_stats() -> JSONResponse:
+    from app.agents.cache import cache_stats
+    return JSONResponse(cache_stats())
+
+
+@app.post("/debug/llm/cache/test", response_class=JSONResponse)
+def test_llm_cache() -> JSONResponse:
+    """Dispatch one fixed generic prompt through the real cache for verification."""
+    from app.agents.cache import cache_stats
+    from app.agents.llm import LLMClient
+    response = LLMClient().complete(
+        "You are a response-cache health check.",
+        "Reply with exactly: cache is working",
+        tier="cheap",
+    )
+    return JSONResponse({"response": response, "cache": cache_stats()})
 
 
 @app.get("/tickets/{ticket_id}", response_class=HTMLResponse)
@@ -95,7 +195,18 @@ def ticket_detail(request: Request, ticket_id: str) -> HTMLResponse:
         ticket = db.get(Ticket, ticket_id)
     if ticket is None:
         return HTMLResponse(content="<h1>Ticket not found</h1>", status_code=404)
-    return templates.TemplateResponse("ticket.html", {"request": request, "ticket": ticket})
+    saved_tokens = set()
+    try:
+        store = RepoTokenStore()
+        saved_tokens = {repo for repo in ticket.repos or [] if store.has_token(repo)}
+    except ValueError:
+        pass
+    return templates.TemplateResponse("ticket.html", {
+        "request": request,
+        "ticket": ticket,
+        "saved_tokens": saved_tokens,
+        "max_agent_retries": settings.max_agent_retries,
+    })
 
 
 @app.post("/tickets")
@@ -240,6 +351,16 @@ async def poll_run_once() -> JSONResponse:
 @app.post("/tickets/{ticket_id}/diagnose", response_class=JSONResponse)
 async def diagnose_ticket(ticket_id: str) -> JSONResponse:
     """Diagnose and plan one subtask, returning at the checkpointed approval gate."""
+    from app.core.publish import preflight
+    try:
+        existing_pr = await preflight(ticket_id)
+    except LookupError:
+        return JSONResponse(status_code=404, content={"error": "ticket_not_found"})
+    if existing_pr:
+        return JSONResponse(status_code=409, content={
+            "error": "open_pr_requires_decision", "existing_pr": existing_pr.__dict__,
+            "message": existing_pr.summary,
+        })
     missing_repo_step: dict | None = None
     with SessionLocal() as db:
         ticket = db.get(Ticket, ticket_id)
@@ -252,7 +373,8 @@ async def diagnose_ticket(ticket_id: str) -> JSONResponse:
             db.commit()
         else:
             error = ""
-            repo = ticket.repos[0].strip()
+            confirmed_repos = [r.strip() for r in ticket.repos if r.strip()]
+            repo = confirmed_repos[0]
             jira_key = ticket.external_key
             title = ticket.title
             description = ticket.description
@@ -295,8 +417,14 @@ async def diagnose_ticket(ticket_id: str) -> JSONResponse:
         jira_key=jira_key,
         subtask_id=subtask_id,
         subtask_type="bug",
+        # The Planner (running first in the graph) reads this as the whole
+        # ticket's ask and overwrites it with the first sub-task's own
+        # description; `repo` here is likewise just the initial default until
+        # the Planner assigns it from confirmed_repos (R-26).
         description=f"{title}\n\n{description}".strip(),
         repo=repo,
+        confirmed_repos=confirmed_repos,
+        orchestration_role="coordinator",
     )
     try:
         await asyncio.to_thread(RepoTool().clone_or_pull, repo, subtask_id)
@@ -365,6 +493,7 @@ async def diagnose_ticket(ticket_id: str) -> JSONResponse:
             "ticket_id": ticket_id,
             "subtask_id": subtask_id,
             "status": final_state.status,
+            "code_context": final_state.code_context,
             "diagnosis": final_state.diagnosis,
             "plan": final_state.model_dump(mode="json")["plan"],
             "approval_status": final_state.approval_status,
@@ -375,8 +504,10 @@ async def diagnose_ticket(ticket_id: str) -> JSONResponse:
             "ticket_id": ticket_id,
             "subtask_id": subtask_id,
             "status": final_state.status,
+            "code_context": final_state.code_context,
             "diagnosis": final_state.diagnosis,
             "plan": final_state.model_dump(mode="json")["plan"],
+            "subtask_specs": final_state.subtask_specs,
             "approval_status": final_state.approval_status,
             "repo": repo,
         }

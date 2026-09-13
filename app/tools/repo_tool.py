@@ -5,6 +5,7 @@ only a convenience for manual testing before the Planner assigns ``SubtaskState.
 """
 
 import logging
+import hashlib
 import os
 import shutil
 import subprocess
@@ -229,6 +230,24 @@ class RepoTool:
     def revision(self, full_name: str, subtask_id: str) -> str:
         checkout = self._checkout_path(full_name, self._workspace_id(subtask_id))
         return self._git(["rev-parse", "HEAD"], cwd=checkout).stdout.strip()
+
+    def file_fingerprints(self, full_name: str, subtask_id: str,
+                          paths: list[str]) -> dict[str, str | None]:
+        """Hash selected files in the current isolated checkout; missing is explicit."""
+        checkout = self._checkout_path(full_name, self._workspace_id(subtask_id))
+        result: dict[str, str | None] = {}
+        for path in dict.fromkeys(paths):
+            target = self._safe_path(checkout, path)
+            result[path] = hashlib.sha256(target.read_bytes()).hexdigest() if target.is_file() else None
+        return result
+
+    def verify_freshness(self, full_name: str, subtask_id: str,
+                         expected: dict[str, str | None]) -> tuple[str, list[str]]:
+        """Refresh default branch and report only diagnosed target files that drifted."""
+        self.clone_or_pull(full_name, subtask_id)
+        current = self.file_fingerprints(full_name, subtask_id, list(expected))
+        drifted = [path for path, fingerprint in expected.items() if current.get(path) != fingerprint]
+        return self.revision(full_name, subtask_id), drifted
 
     def prepare_execution(self, full_name: str, subtask_id: str, base_commit: str,
                           changes: dict[str, str]) -> Path:

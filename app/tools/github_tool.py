@@ -11,6 +11,7 @@ from typing import Optional
 
 from github import Auth, Github
 from github.Repository import Repository
+from urllib3.util.retry import Retry
 
 from app.config import settings
 
@@ -36,7 +37,13 @@ class GitHubTool:
 
     def __init__(self, repo_tool=None) -> None:
         self.repo_tool = repo_tool
-        self._client = Github(auth=Auth.Token(settings.github_token))
+        self._retry = Retry(
+            total=settings.external_retry_attempts,
+            backoff_factor=settings.external_retry_base_seconds,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=frozenset({"GET", "POST", "PUT", "PATCH", "DELETE"}),
+        )
+        self._client = Github(auth=Auth.Token(settings.github_token), retry=self._retry)
 
     def _check_allowlist(self, full_name: str) -> None:
         """Allowlist hook (R-19). Logs a warning if the repo isn't in the list.
@@ -65,7 +72,7 @@ class GitHubTool:
             from app.tools.repo_tokens import RepoTokenStore
             token = RepoTokenStore().get(target)
             if token:
-                client = Github(auth=Auth.Token(token))
+                client = Github(auth=Auth.Token(token), retry=self._retry)
         repo = client.get_repo(target)
         logger.info("github.get_repo -> default_branch=%r", repo.default_branch)
         return repo
@@ -112,11 +119,13 @@ class GitHubTool:
 
     def find_pr(self, full_name: str, branch: str) -> dict | None:
         repo = self.get_repo(full_name)
-        for pr in repo.get_pulls(state="all", head=f"{repo.owner.login}:{branch}"):
-            return {"id": str(pr.id), "number": pr.number, "url": pr.html_url,
-                    "state": "merged" if pr.merged else pr.state, "branch": branch,
-                    "repo": full_name}
-        return None
+        found = list(repo.get_pulls(state="all", head=f"{repo.owner.login}:{branch}"))
+        if not found:
+            return None
+        pr = next((item for item in found if item.state == "open"), found[0])
+        return {"id": str(pr.id), "number": pr.number, "url": pr.html_url,
+                "state": "merged" if pr.merged else pr.state, "branch": branch,
+                "repo": full_name}
 
     def publish_changes(self, state) -> dict:
         from app.tools.repo_tool import RepoTool
@@ -129,12 +138,6 @@ class GitHubTool:
             raise ValueError('Every step must have passing or inconclusive (no-tests) results')
         tool = self.repo_tool or RepoTool(github=self)
         branch = tool.branch_name(state.subtask_id)
-        existing = self.find_pr(state.repo, branch)
-        if existing:
-            if existing['state'] != 'open':
-                raise ValueError('The subtask PR is already closed/merged; start a fresh approved attempt')
-            return existing
-        tool.push_changes(state.repo, state.subtask_id, state.base_commit, state.file_changes)
         title = f"{state.jira_key or 'SDLC'}: {state.description.splitlines()[0][:180]}"
         body = 'Implements the approved plan:\n\n' + '\n'.join(
             f'- {step.intent} (`{step.target_file}`)' for step in state.plan)
@@ -142,6 +145,19 @@ class GitHubTool:
             body += ('\n\n**Unverifiable:** this repository has no tests, so this change could not be run '
                      'against a test suite — please review manually.\n')
         body += '\n\nValidation: pytest passed after each step.\n\n' + (f'Jira: {state.jira_key}' if state.jira_key else '')
+        existing = self.find_pr(state.repo, branch)
+        if existing:
+            if existing['state'] == 'open':
+                return existing
+            if existing['state'] == 'merged':
+                raise ValueError('The subtask PR is already merged; start a fresh approved attempt')
+            # A human-approved redo may create another PR from the same tested branch.
+            self.open_pr(state.repo, branch, title, body)
+            result = self.find_pr(state.repo, branch)
+            if result and result['state'] == 'open':
+                return result
+            raise RuntimeError('Replacement PR creation returned without a discoverable open PR')
+        tool.push_changes(state.repo, state.subtask_id, state.base_commit, state.file_changes)
         self.open_pr(state.repo, branch, title, body)
         result = self.find_pr(state.repo, branch)
         if not result:
@@ -156,6 +172,9 @@ class GitHubTool:
 
     def comment_pr(self, full_name: str, number: int, message: str) -> None:
         self.get_repo(full_name).get_issue(number).create_comment(message)
+
+    def close_pr(self, full_name: str, number: int) -> None:
+        self.get_repo(full_name).get_pull(number).edit(state="closed")
 
 
     def pr_commit_messages(self, full_name: str, number: int) -> list[str]:

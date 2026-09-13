@@ -7,12 +7,14 @@ from app.tools.test_runner import TestResult
 class EditProposal(BaseModel):
     model_config = ConfigDict(extra="forbid")
     blocks: list[EditBlock] = Field(default_factory=list, max_length=20)
+    full_content: str | None = None
     unable_reason: str | None = None
 
     @model_validator(mode='after')
     def outcome(self):
-        if bool(self.blocks) == bool(self.unable_reason):
-            raise ValueError('Provide blocks or an honest unable_reason')
+        outcomes = int(bool(self.blocks)) + int(self.full_content is not None) + int(bool(self.unable_reason))
+        if outcomes != 1:
+            raise ValueError('Provide exactly one of blocks, full_content, or an honest unable_reason')
         return self
 
 

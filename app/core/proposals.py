@@ -12,6 +12,7 @@ from app.agents.planning import ApprovalDecision
 from app.agents.state import SubtaskState
 from app.config import settings
 from app.core.subtasks import prepare_subtask, ACTIVE_SUBTASK_STATUSES
+from app.core.approvals import _expire_older_pending
 from app.db.connection import SessionLocal
 from app.db.models import PendingApproval, Ticket, Subtask
 from app.events import log_event
@@ -21,6 +22,7 @@ def proposal_record(ticket_id, key, comment_id, intent):
     with SessionLocal() as db:
         row = db.scalar(select(PendingApproval).where(PendingApproval.source_comment_id == comment_id))
         if row is None:
+            _expire_older_pending(db, ticket_id)
             row = PendingApproval(ticket_id=UUID(ticket_id), jira_issue_key=key, source_comment_id=comment_id,
                 proposed_action={'kind': 'command', 'action': intent.action, 'description': intent.proposal})
             db.add(row)

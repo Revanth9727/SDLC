@@ -215,9 +215,8 @@ JIRA_POLL_INTERVAL_MINUTES=30
 STUCK_THRESHOLD_MINUTES=120
 
 # --- Webhooks (event-driven fast path; Phase 5.5) ---
-# GitHub signs request bodies with its secret. Jira Cloud UI webhooks do not sign;
-# put its secret in the callback URL: /webhooks/jira?secret=JIRA_WEBHOOK_SECRET.
-# Use smee.io or ngrok to expose localhost during dev.
+# Shared secrets to verify inbound webhooks are genuine. Set these when you register
+# the webhooks in GitHub/Jira. Use smee.io or ngrok to expose localhost during dev.
 GITHUB_WEBHOOK_SECRET=REPLACE_ME
 JIRA_WEBHOOK_SECRET=REPLACE_ME
 

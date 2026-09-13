@@ -1,13 +1,16 @@
 """One PR/Jira transition matrix used by webhooks and polling."""
 import asyncio
+import logging
 from datetime import datetime, timezone
 import re
 from sqlalchemy import select
 from app.db.connection import SessionLocal
-from app.db.models import PRLink, Ticket, Subtask
+from app.db.models import PRLink, Ticket, Subtask, SubtaskMemory
 from app.events import log_event
 from app.tools.github_tool import GitHubTool
 from app.tools.jira_tool import JiraTool
+
+logger = logging.getLogger(__name__)
 
 
 def extract_key(*texts: str) -> str | None:
@@ -30,6 +33,7 @@ def record_pr(key, snapshot):
 
 
 def _sync(key, snapshot, jira, github, reopened=False):
+    completed_states = []
     record_pr(key, snapshot)
     with SessionLocal() as db:
         row = db.scalar(select(PRLink).where(PRLink.github_pr_id == str(snapshot['id'])).with_for_update())
@@ -44,6 +48,7 @@ def _sync(key, snapshot, jira, github, reopened=False):
         state = snapshot['state']
         reopened = reopened or (previous_category == 'done' and category in {'new', 'indeterminate'})
         if reopened:
+            jira.set_status(key, 'in_progress')
             if state == 'merged':
                 messages.append(f"Ticket reopened, but PR #{row.number} already merged — a new PR/branch is needed.")
             elif state == 'closed':
@@ -60,8 +65,8 @@ def _sync(key, snapshot, jira, github, reopened=False):
                         local.status, local.claimed_at = 'done', None
             elif state == 'open':
                 messages.append(f"PR #{row.number} opened: {row.url}")
-                if category == 'new':
-                    jira.set_status(key, 'in_progress')
+                if not reopened:
+                    jira.set_status(key, 'in_review')
             else:
                 messages.append(f"PR #{row.number} closed without merge / branch abandoned: {row.url}")
         for message in messages:
@@ -77,8 +82,24 @@ def _sync(key, snapshot, jira, github, reopened=False):
                     task.status = 'done' if state == 'merged' else 'needs_human'
                     task.state = {**task.state, 'status': task.status,
                                   'failure_reason': None if state == 'merged' else 'PR closed without merge'}
+                    if state == 'merged':
+                        completed_states.append(task.state)
         db.commit()
-        return str(local.id) if local else None, messages
+        ticket_id = str(local.id) if local else None
+    # The PR-open path normally wrote this already. A merge retries only when that
+    # non-critical write failed, preserving one summarization call per resolution.
+    for raw_state in completed_states:
+        try:
+            with SessionLocal() as db:
+                exists = db.scalar(select(SubtaskMemory.id).where(
+                    SubtaskMemory.subtask_id == raw_state['subtask_id']))
+            if not exists:
+                from app.agents.state import SubtaskState
+                from app.memory.store import write_resolution
+                write_resolution(SubtaskState.model_validate(raw_state), 'success')
+        except Exception:
+            logger.warning('Could not write done-state memory for %s', raw_state.get('subtask_id'), exc_info=True)
+    return ticket_id, messages
 
 
 async def sync_pr(key, snapshot, jira=None, github=None, *, reopened=False):
@@ -86,6 +107,11 @@ async def sync_pr(key, snapshot, jira=None, github=None, *, reopened=False):
     if ticket_id:
         for message in messages:
             await log_event(ticket_id=ticket_id, agent='pr_sync', stage='pr_state', message=message)
+        if snapshot.get('state') in {'merged', 'closed'}:
+            # Closing/merging lifts R-53's one-open-PR gate. Any already-tested
+            # integration result can now publish its next PR without more LLM work.
+            from app.orchestrator.scheduler import advance_ticket
+            await advance_ticket(ticket_id)
 
 
 def links_for(key=None):

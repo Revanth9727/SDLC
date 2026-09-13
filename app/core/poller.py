@@ -69,8 +69,13 @@ async def start_loop(emit: Callable[[dict], Awaitable[None]]) -> asyncio.Task:
             "poller: loop started — interval=%d min", settings.jira_poll_interval_minutes
         )
         while True:
+            try:
+                await poll_cycle(emit)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("poller_cycle_failed")
             await asyncio.sleep(interval)
-            await poll_cycle(emit)
 
     return asyncio.create_task(_loop(), name="jira_poller")
 
@@ -89,6 +94,12 @@ async def _do_poll(emit: Callable[[dict], Awaitable[None]]) -> list[dict]:
     except Exception as exc:
         logger.warning('PR reconciliation failed: %s', exc)
     jira.fetch_project_statuses(force_refresh=True)
+
+    try:
+        from app.core.approvals import process_gate_timeouts
+        await process_gate_timeouts(jira)
+    except Exception as exc:
+        logger.error("poller: approval timeout processing failed: %s", exc)
 
     # Step 2: reconcile drift BEFORE claiming (R-28).
     # Runs inside the overlap guard so it never races with itself.

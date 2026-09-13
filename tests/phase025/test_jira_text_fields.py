@@ -137,7 +137,7 @@ def test_get_issue_text_fields_includes_description_environment_and_comments(mon
     assert "github.com/owner/from-comment" in fields["comments"]
 
 
-def test_recent_comments_orders_oldest_first_and_marks_the_tools_own_messages(monkeypatch) -> None:
+def test_recent_comments_orders_oldest_first_and_marks_app_comments_by_durable_id(monkeypatch) -> None:
     monkeypatch.setattr(
         jira_tool,
         "settings",
@@ -179,6 +179,7 @@ def test_recent_comments_orders_oldest_first_and_marks_the_tools_own_messages(mo
 
     tool = JiraTool()
     monkeypatch.setattr(tool, "_client", _ThreadClient)
+    monkeypatch.setattr("app.core.jira_comments.is_app_comment", lambda comment_id: comment_id == "2")
 
     thread = tool.recent_comments("SCRUM-1", limit=12)
 

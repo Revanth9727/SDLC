@@ -1,0 +1,20 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Needs human</title><link rel="stylesheet" href="/static/style.css"></head>
+<body><header class="app-header"><div class="app-header__inner">
+<a class="brand" href="/"><span class="brand-mark">SD</span><span>Agentic SDLC</span></a>
+<nav class="app-nav" aria-label="Primary"><a href="/">Tickets</a><a href="/escalations">Needs human</a><a href="/settings/statuses">Jira statuses</a></nav>
+</div></header><main class="page-stack"><div class="page-heading"><div><div class="eyebrow">Review queue</div><h1>Needs human</h1><p>Resolve blocked attempts and budget pauses without losing their saved state.</p></div></div>
+<div class="escalation-list">{% for item in items %}<section class="card escalation-card"><h2><a href="/tickets/{{ item.ticket_id }}">{{ item.description }}</a></h2>
+<p>{{ item.state.failure_reason or 'This attempt needs human help.' }}</p>
+<details><summary>State so far</summary><pre>{{ item.state|tojson(indent=2) }}</pre></details>
+<label>Resolution note <textarea id="note-{{ item.id }}" maxlength="4000"></textarea></label>
+<div class="action-row"><button class="primary-button" onclick="resolveItem('{{ item.ticket_id }}','{{ item.id }}','retry','{{ item.state.escalation_id }}',this)">Retry / Continue budget</button>
+<button class="danger-button" onclick="resolveItem('{{ item.ticket_id }}','{{ item.id }}','reject','{{ item.state.escalation_id }}',this)">Reject and close</button></div>
+<p class="inline-status" role="status"></p></section>{% else %}<section class="card"><p class="empty-state">No escalated subtasks.</p></section>{% endfor %}</div>
+</main><script>
+async function resolveItem(ticket,subtask,action,escalation_id,button){
+ const card=button.closest('section');card.querySelectorAll('button').forEach(b=>b.disabled=true);
+ try {const response=await fetch(`/tickets/${ticket}/subtasks/${subtask}/escalation/${action}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({escalation_id,note:document.getElementById(`note-${subtask}`).value})});
+ const data=await response.json();if(!response.ok)throw Error(data.detail || 'Resolution failed');location.assign(`/tickets/${ticket}`);
+ }catch(e){card.querySelector('[role=status]').textContent=e.message;card.querySelectorAll('button').forEach(b=>b.disabled=false);}
+}
+</script></body></html>

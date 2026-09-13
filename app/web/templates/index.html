@@ -7,11 +7,23 @@
   <link rel="stylesheet" href="/static/style.css" />
 </head>
 <body>
-  <main>
-    <h1>Agentic SDLC</h1>
+  {% set cache = cache_stats|default({'hit_rate': 0, 'exact_hits': 0, 'semantic_hits': 0, 'misses': 0}, true) %}
+  <header class="app-header"><div class="app-header__inner">
+    <a class="brand" href="/"><span class="brand-mark">SD</span><span>Agentic SDLC</span></a>
+    <nav class="app-nav" aria-label="Primary"><a href="/">Tickets</a><a href="/escalations">Needs human</a><a href="/settings/statuses">Jira statuses</a></nav>
+  </div></header>
+  <main class="page-stack">
+    <div class="page-heading">
+      <div><div class="eyebrow">Workspace</div><h1>Tickets</h1><p>Review intake, repository ownership, and active delivery work.</p></div>
+      <div class="cache-stat" aria-label="LLM response cache statistics">
+        <span>LLM cache</span>
+        <strong id="cache-hit-rate">{{ '%.1f'|format(cache.hit_rate * 100) }}%</strong>
+        <small id="cache-hit-detail">{{ cache.exact_hits + cache.semantic_hits }} hits / {{ cache.misses }} misses</small>
+      </div>
+    </div>
 
     <section class="card">
-      <h2>Submit a ticket</h2>
+      <div class="card-header"><div><h2>Submit a ticket</h2><p>Create a local ticket for manual intake.</p></div></div>
       <form method="post" action="/tickets">
         <label for="title">Title</label>
         <input id="title" name="title" type="text" placeholder="Short description of the task" required />
@@ -25,9 +37,9 @@
     </section>
 
     <section class="card">
-      <h2>Tickets</h2>
+      <div class="card-header"><div><h2>Ticket queue</h2><p>{{ tickets|length }} ticket{{ '' if tickets|length == 1 else 's' }} currently tracked</p></div></div>
       {% if tickets %}
-      <table>
+      <div class="table-wrap"><table>
         <thead>
           <tr>
             <th>Jira Key</th>
@@ -42,7 +54,7 @@
           {% for ticket in tickets %}
           <tr>
             <td class="mono">{{ ticket.external_key or '—' }}</td>
-            <td><a href="/tickets/{{ ticket.id }}" style="color:#6366f1;text-decoration:none;font-weight:500">{{ ticket.title }}</a></td>
+            <td><a class="ticket-link" href="/tickets/{{ ticket.id }}">{{ ticket.title }}</a></td>
             <td><span class="badge badge--{{ ticket.status }}">{{ ticket.status }}</span></td>
             <td>{% if ticket.claimed_at %}<span class="badge badge--processing">claimed</span>{% else %}—{% endif %}</td>
             <td class="repo-cell">
@@ -57,7 +69,7 @@
           </tr>
           {% endfor %}
         </tbody>
-      </table>
+      </table></div>
       {% else %}
       <p class="empty">No tickets yet — submit one above.</p>
       {% endif %}
@@ -69,16 +81,28 @@
     </section>
 
     <section class="card">
-      <h2>Jira poller</h2>
+      <div class="card-header"><div><h2>Jira poller</h2><p>Scan the configured project for ready tickets.</p></div></div>
       <form id="poll-form">
         <button type="submit" id="poll-btn">Run poll now</button>
-        <span id="poll-status" style="margin-left:0.75rem;font-size:0.85rem;color:#666;"></span>
+        <span id="poll-status" class="inline-status"></span>
       </form>
-      <div id="poll-events" style="margin-top:1rem;"></div>
+      <div id="poll-events" class="poll-events"></div>
     </section>
   </main>
 
   <script>
+    async function refreshCacheStats() {
+      try {
+        const response = await fetch('/debug/llm/cache');
+        if (!response.ok) return;
+        const stats = await response.json();
+        document.getElementById('cache-hit-rate').textContent = `${(stats.hit_rate * 100).toFixed(1)}%`;
+        document.getElementById('cache-hit-detail').textContent =
+          `${stats.exact_hits + stats.semantic_hits} hits / ${stats.misses} misses`;
+      } catch (_) {}
+    }
+    setInterval(refreshCacheStats, 5000);
+
     // ── Repo resolution ──────────────────────────────────────────────────────
     let _resolveKey = null;
 

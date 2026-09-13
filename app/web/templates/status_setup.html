@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Jira status settings</title>
+<link rel="stylesheet" href="/static/style.css"></head>
+<body><header class="app-header"><div class="app-header__inner">
+<a class="brand" href="/"><span class="brand-mark">SD</span><span>Agentic SDLC</span></a>
+<nav class="app-nav" aria-label="Primary"><a href="/">Tickets</a><a href="/escalations">Needs human</a><a href="/settings/statuses">Jira statuses</a></nav>
+</div></header><main class="settings-page page-stack">
+<div class="page-heading"><div><div class="eyebrow">Settings · {{ project }}</div><h1>Jira workflow statuses</h1><p>Assign each Jira status its role in the delivery workflow.</p></div><button id="reload" type="button">Reload from Jira</button></div>
+<section class="card"><div class="card-header"><div><h2>Status mapping</h2><p>Category matching remains the fallback for meanings left unset. Rows with the same meaning are tried in order.</p></div></div>
+<form id="setup"><div class="table-wrap settings-table"><table><thead><tr><th>Status</th><th>Meaning</th><th>Review</th><th></th></tr></thead><tbody id="rows"></tbody></table></div>
+<div class="settings-actions"><button id="add" type="button">Add status</button><button id="save" type="submit" disabled>Save status map</button></div></form></section>
+<p id="message" class="status-message" role="status"></p>
+<script>
+const rows = document.getElementById('rows'), message = document.getElementById('message');
+let data;
+function option(value, label) { const o=document.createElement('option'); o.value=value; o.textContent=label; return o; }
+function addRow(row) {
+  const tr=document.createElement('tr'), status=document.createElement('select'), meaning=document.createElement('select');
+  status.setAttribute('aria-label','Jira status'); meaning.setAttribute('aria-label','Status meaning');
+  const available=[...data.statuses];
+  if(row && !available.some(s=>s.id===row.id)) available.push({...row, category:'unavailable'});
+  for(const s of available) status.append(option(s.id, `${s.name} (${s.category || 'unknown'}) · ${s.id}`));
+  for(const m of data.meanings) meaning.append(option(m,m));
+  if(row) {status.value=row.id; meaning.value=row.meaning;}
+  const review=document.createElement('input'); review.type='checkbox'; review.setAttribute('aria-label','Confirm suggested meaning');
+  const label=document.createElement('label'); label.append(review,document.createTextNode(' Confirm suggestion'));
+  function hint() { const s=data.statuses.find(s=>s.id===status.value); if(s) meaning.value=s.meaning; review.required=!!s?.low_confidence; review.checked=!review.required; label.hidden=!review.required; }
+  status.onchange=hint; hint();
+  if(row) {meaning.value=row.meaning; if(data.saved) {review.required=false;label.hidden=true;}}
+  const remove=document.createElement('button');remove.type='button';remove.textContent='Remove';remove.onclick=()=>tr.remove();
+  for(const el of [status,meaning,label,remove]) {const td=document.createElement('td');td.append(el);tr.append(td);}
+  tr.status=status;tr.meaning=meaning;rows.append(tr);
+}
+async function load() {
+  try {const response=await fetch('/settings/statuses/data'); if(!response.ok) throw Error('Could not load settings'); data=await response.json();
+    rows.replaceChildren(); for(const row of data.saved?.rows ?? data.statuses) addRow(row);
+    message.textContent=data.error || (data.saved ? 'Loaded saved project map.' : 'Review the suggestions and save your map.');
+    document.getElementById('save').disabled=!!data.error; document.getElementById('add').disabled=!data.statuses.length;
+  } catch(e) {message.textContent=e.message;}
+}
+document.getElementById('reload').onclick=load;
+document.getElementById('add').onclick=()=>addRow();
+document.getElementById('setup').onsubmit=async e=>{
+  e.preventDefault(); const button=document.getElementById('save');button.disabled=true;
+  try {const body={rows:[...rows.children].map(tr=>({id:tr.status.value,name:data.statuses.find(s=>s.id===tr.status.value)?.name || '',meaning:tr.meaning.value}))};
+    const response=await fetch('/settings/statuses',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const result=await response.json(); if(!response.ok) throw Error(typeof result.detail==='string'?result.detail:JSON.stringify(result.detail));
+    location.assign('/');
+  }catch(e){message.textContent=e.message;button.disabled=false;}
+};
+const stream=new EventSource('/settings/statuses/events');stream.addEventListener('status_map_saved',()=>{message.textContent='Project status map saved.';});
+load();
+</script></main></body></html>

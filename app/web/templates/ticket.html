@@ -7,6 +7,10 @@
   <link rel="stylesheet" href="/static/style.css" />
 </head>
 <body>
+  <header class="app-header"><div class="app-header__inner">
+    <a class="brand" href="/"><span class="brand-mark">SD</span><span>Agentic SDLC</span></a>
+    <nav class="app-nav" aria-label="Primary"><a href="/">Tickets</a><a href="/escalations">Needs human</a><a href="/settings/statuses">Jira statuses</a></nav>
+  </div></header>
   <main class="ticket-page">
     <a href="/" class="back-link">&larr; All tickets</a>
 
@@ -29,6 +33,16 @@
       </div>
     </section>
 
+    <section id="open-pr-panel" class="workflow-section" hidden>
+      <div class="section-heading"><h2>Open pull request</h2><span class="badge badge--in_review">Decision needed</span></div>
+      <p id="open-pr-summary" class="supporting-text"></p>
+      <div class="action-row">
+        <a id="open-pr-link" class="secondary-button" target="_blank" rel="noopener noreferrer">Open PR</a>
+        <button id="redo-pr-btn" type="button" class="danger-button">Replace PR</button>
+        <span id="redo-pr-status" class="inline-status"></span>
+      </div>
+    </section>
+
     <section id="repo-panel" class="workflow-section" hidden>
       <div class="section-heading"><h2>Repository</h2><button type="button" class="icon-close" id="repo-close" aria-label="Close repository panel">&times;</button></div>
       <div id="repo-body" aria-live="polite"></div>
@@ -40,8 +54,10 @@
       {% for repo in ticket.repos %}
       <div class="repo-choice">
         <code>{{ repo }}</code>
+        {% if repo in saved_tokens %}<span>Encrypted token saved · reused automatically</span>{% endif %}
+        <details><summary>{{ 'Replace saved token' if repo in saved_tokens else 'Add token if needed' }}</summary>
         <input class="repo-token" data-repo="{{ repo }}" type="password" autocomplete="off" placeholder="Private token" aria-label="Private token for {{ repo }}" />
-        <button type="button" class="secondary-button" onclick='saveRepoToken({{ repo|tojson }})'>Save token</button>
+        <button type="button" class="secondary-button" onclick='saveRepoToken({{ repo|tojson }})'>Save token</button></details>
       </div>
       {% endfor %}
       <p id="token-status" class="inline-status" role="status"></p>
@@ -54,11 +70,32 @@
         <button type="button" id="diagnose-btn" class="primary-button" hidden>Run diagnosis &amp; plan</button>
       </div>
       <p id="diagnose-status" class="inline-status" role="status"></p>
+      <div id="overall-progress" class="overall-progress" hidden></div>
       <div id="active-summary" class="run-summary empty-state">Loading run state...</div>
       <div id="failure-panel" class="failure-panel" hidden>
         <strong>Needs attention</strong><p id="failure-reason"></p>
         <button type="button" id="retry-btn" class="primary-button">Retry</button>
       </div>
+    </section>
+
+    <section id="decomposition-panel" class="workflow-section" hidden>
+      <div class="section-heading"><h2>Decomposition</h2><span id="intent-gate-badge" class="badge badge--awaiting_approval" hidden>Awaiting confirmation</span></div>
+      <ol id="decomposition-list" class="plan-list"></ol>
+      <p id="decomposition-reasoning" class="supporting-text"></p>
+      <div id="intent-approval-controls" hidden>
+        <label for="intent-decision-note">Decision note</label>
+        <textarea id="intent-decision-note" maxlength="4000" placeholder="Optional — why this reading is wrong"></textarea>
+        <div class="action-row">
+          <button type="button" id="intent-approve-btn" class="primary-button">Confirm</button>
+          <button type="button" id="intent-reject-btn" class="danger-button">Reject</button>
+        </div>
+        <p id="intent-approval-status" class="inline-status" role="status"></p>
+      </div>
+    </section>
+
+    <section id="subtask-panel" class="workflow-section" hidden>
+      <div class="section-heading"><h2>Sub-task workflow</h2><span class="field-label">Sequential by dependency</span></div>
+      <div id="subtask-board" class="subtask-board"></div>
     </section>
 
     <section id="diagnosis-panel" class="workflow-section" hidden>
@@ -68,13 +105,25 @@
       <p id="diagnosis-reasoning" class="supporting-text"></p>
     </section>
 
+    <section id="code-intelligence-panel" class="workflow-section" hidden aria-live="polite">
+      <div class="section-heading"><h2>Code intelligence</h2><span id="code-confidence" class="badge"></span></div>
+      <p id="code-hypothesis" class="root-cause"></p>
+      <dl class="ticket-facts code-intelligence-facts">
+        <div><dt>Investigation</dt><dd id="code-investigation-type"></dd></div>
+        <div><dt>Snapshot</dt><dd><code id="code-snapshot"></code></dd></div>
+        <div><dt>Commit</dt><dd><code id="code-commit"></code></dd></div>
+      </dl>
+      <div><span class="field-label">Relevant files</span><div id="code-files" class="file-list"></div></div>
+      <div class="code-evidence"><span class="field-label">Verified evidence</span><div id="code-evidence-list"></div></div>
+    </section>
+
     <section id="plan-panel" class="workflow-section" hidden>
       <div class="section-heading"><h2>Plan</h2><span id="gate-badge" class="badge badge--awaiting_approval" hidden>Awaiting approval</span></div>
       <ol id="plan-list" class="plan-list"></ol>
       <p id="plan-reasoning" class="supporting-text"></p>
       <div id="approval-controls" hidden>
         <label for="decision-note">Decision note</label>
-        <textarea id="decision-note" maxlength="4000" placeholder="Required when rejecting"></textarea>
+        <textarea id="decision-note" maxlength="4000" placeholder="Describe a revision, or leave blank to be asked"></textarea>
         <div class="action-row">
           <button type="button" id="approve-btn" class="primary-button">Approve</button>
           <button type="button" id="reject-btn" class="danger-button">Reject</button>
@@ -86,6 +135,29 @@
     <section id="execution-panel" class="workflow-section" hidden>
       <h2>Execution and pull request</h2>
       <div id="execution-results"></div>
+    </section>
+    <section id="critic-panel" class="workflow-section" aria-live="polite">
+      <div class="section-heading">
+        <h2>Critic verdict</h2>
+        <span id="critic-decision" class="badge">Not reviewed</span>
+      </div>
+      <div id="critic-empty" class="critic-empty">
+        <strong>Review pending</strong>
+        <p>The Critic has not reviewed the current change yet.</p>
+      </div>
+      <div id="critic-result" hidden>
+        <dl class="critic-facts">
+          <div><dt>Decision</dt><dd id="critic-decision-text"></dd></div>
+          <div><dt>Verifiability</dt><dd><span id="critic-verifiability" class="badge"></span></dd></div>
+          <div><dt>Review attempts</dt><dd id="critic-retries"></dd></div>
+        </dl>
+        <div id="critic-warning" class="critic-warning" hidden></div>
+        <div class="critic-feedback">
+          <span class="field-label">Feedback</span>
+          <p id="critic-feedback-text"></p>
+        </div>
+        <p id="critic-escalation" class="failure-text" hidden></p>
+      </div>
     </section>
     <section id="proposals-panel" class="workflow-section" hidden>
       <h2>Requested changes awaiting approval</h2>
@@ -106,6 +178,7 @@
     const TICKET_ID = {{ (ticket.id|string)|tojson }};
     const HAS_REPO = {{ 'true' if ticket.repos else 'false' }};
     const INITIAL_STATUS = {{ ticket.status|tojson }};
+    const MAX_AGENT_RETRIES = {{ max_agent_retries|tojson }};
     const ACTIVE_STATUSES = new Set(['running', 'waiting', 'pending']);
     let currentGate = null;
     let emptyEl = document.getElementById('feed-empty');
@@ -127,21 +200,69 @@
       if (!response.ok) throw new Error(errorMessage(rows, 'Could not load run state'));
       renderWorkflow(rows);
       await loadProposals();
+      await loadOpenPR();
     }
+
+    async function loadOpenPR() {
+      const response = await fetch(`/tickets/${TICKET_ID}/open-pr`);
+      if (!response.ok) return;
+      const current = (await response.json()).open_pr;
+      const panel = byId('open-pr-panel');
+      panel.hidden = !current;
+      if (!current) return;
+      byId('open-pr-summary').textContent = `PR #${current.number}${current.title ? ` "${current.title}"` : ''} is ${current.state}. Keep it, or replace it with a fresh PR.`;
+      byId('open-pr-link').href = current.url;
+    }
+
+    byId('redo-pr-btn').onclick = async () => {
+      const button = byId('redo-pr-btn');
+      const status = byId('redo-pr-status');
+      button.disabled = true;
+      status.textContent = 'Replacing pull request...';
+      try {
+        const response = await fetch(`/tickets/${TICKET_ID}/redo-pr`, {method: 'POST'});
+        const data = await response.json();
+        if (!response.ok) throw new Error(errorMessage(data, 'Could not replace PR'));
+        status.textContent = 'Replacement PR created';
+        await loadSubtasks();
+      } catch (error) {
+        status.textContent = error.message;
+      } finally {
+        button.disabled = false;
+      }
+    };
 
     function renderWorkflow(rows) {
       const newest = [...rows].reverse();
       const active = newest.find(row => ACTIVE_STATUSES.has(row.status));
       const latest = newest[0];
       const display = active || latest;
-      renderActive(active);
+      const workRows = rows.filter(row => row.state?.orchestration_role === 'work')
+        .sort((a, b) => (a.state?.orchestration_index ?? Number.MAX_SAFE_INTEGER) -
+                        (b.state?.orchestration_index ?? Number.MAX_SAFE_INTEGER));
+      const coordinator = newest.find(row => row.state?.orchestration_role === 'coordinator');
+      renderActive(active, workRows);
+      renderDecomposition(coordinator || display, active?.waiting ? active : null);
+      renderSubtasks(workRows);
+      const multi = workRows.length > 0;
+      renderCodeIntelligence(display?.state?.code_context);
       renderDiagnosis(display?.state?.diagnosis);
       renderPlan(display, active?.waiting ? active : null);
       renderFailure(latest, active);
       renderExecution(display);
+      renderCritic(display);
       renderHistory(rows, active?.subtask_id);
+      ['code-intelligence-panel', 'diagnosis-panel', 'plan-panel', 'execution-panel', 'critic-panel'].forEach(id => {
+        if (multi) byId(id).hidden = true;
+      });
 
-      const status = active?.waiting ? 'awaiting_approval' : (active?.status || latest?.status || INITIAL_STATUS);
+      const childStatuses = workRows.map(row => row.status);
+      const hasSuccess = childStatuses.some(status => ['in_review', 'done'].includes(status));
+      const hasFailure = childStatuses.some(status => ['needs_human', 'failed'].includes(status));
+      const allSettled = childStatuses.length && childStatuses.every(status => ['in_review', 'done', 'needs_human', 'failed'].includes(status));
+      const aggregate = allSettled && hasSuccess && hasFailure ? 'mixed' :
+        (allSettled && hasFailure ? 'needs_human' : (allSettled ? 'in_review' : null));
+      const status = active?.waiting ? 'awaiting_approval' : (aggregate || active?.status || latest?.status || INITIAL_STATUS);
       const badge = byId('ticket-status');
       badge.textContent = status;
       badge.className = `badge badge--${status}`;
@@ -151,9 +272,18 @@
       byId('diagnose-btn').disabled = false;
     }
 
-    function renderActive(active) {
+    function renderActive(active, workRows = []) {
       const target = byId('active-summary');
       target.replaceChildren();
+      const progress = byId('overall-progress');
+      progress.hidden = !workRows.length;
+      if (workRows.length) {
+        const approved = workRows.filter(row => row.state?.approval_status === 'approved').length;
+        const executing = workRows.filter(row => ACTIVE_STATUSES.has(row.status) && row.state?.approval_status === 'approved').length;
+        const review = workRows.filter(row => ['in_review', 'done'].includes(row.status)).length;
+        const blocked = workRows.filter(row => ['needs_human', 'failed'].includes(row.status)).length;
+        progress.textContent = `${approved}/${workRows.length} approved · ${executing} executing · ${review} PR-ready · ${blocked} needs human`;
+      }
       if (!active) {
         target.className = 'run-summary empty-state';
         target.textContent = 'No active subtask.';
@@ -193,6 +323,118 @@
       });
     }
 
+    function renderSubtasks(rows) {
+      const panel = byId('subtask-panel');
+      const board = byId('subtask-board');
+      panel.hidden = !rows.length;
+      board.replaceChildren();
+      if (!rows.length) return;
+      const labels = new Map(rows.map(row => [row.subtask_id, row.state?.spec_id || row.subtask_id]));
+      rows.forEach((row, index) => {
+        const state = row.state || {};
+        const article = document.createElement('article');
+        article.className = `subtask-card subtask-card--${row.status}`;
+        const heading = document.createElement('div');
+        heading.className = 'subtask-heading';
+        const title = document.createElement('div');
+        title.append(textNode('span', `Sub-task ${state.spec_id || index + 1}`, 'field-label'),
+                     textNode('h3', state.description || 'Untitled sub-task'));
+        heading.append(title, textNode('span', row.waiting ? 'awaiting approval' : row.status,
+                                      `badge badge--${row.waiting ? 'awaiting_approval' : row.status}`));
+        article.appendChild(heading);
+
+        const meta = document.createElement('p');
+        meta.className = 'subtask-meta';
+        const dependencies = (state.depends_on || []).map(id => labels.get(id) || id);
+        meta.textContent = `${state.repo || 'No repo'} · ${dependencies.length ? `Depends on ${dependencies.join(', ')}` : 'No dependencies'}`;
+        article.appendChild(meta);
+        if (row.status === 'queued') article.appendChild(textNode('p', 'Queued until earlier dependencies finish.', 'empty-state'));
+        if (row.status === 'integration_pending') article.appendChild(textNode('p', 'Critic approved. Waiting for whole-ticket integration before PR publication.', 'integration-pending-note'));
+        if (state.code_context?.hypothesis) {
+          const intelligence = document.createElement('div');
+          intelligence.className = 'subtask-intelligence';
+          intelligence.append(
+            textNode('strong', 'Code intelligence · ' + Math.round(Number(state.code_context.confidence || 0) * 100) + '% confidence'),
+            textNode('p', state.code_context.hypothesis)
+          );
+          const count = (state.code_context.verified_evidence || []).filter(item => item.verified).length;
+          intelligence.appendChild(textNode('small', count + ' source citation' + (count === 1 ? '' : 's') + ' verified'));
+          article.appendChild(intelligence);
+        }
+        if (state.diagnosis?.root_cause) {
+          article.appendChild(textNode('p', `Diagnosis: ${state.diagnosis.root_cause}`, 'subtask-diagnosis'));
+        }
+        if (state.plan?.length) {
+          const plan = document.createElement('ol');
+          plan.className = 'plan-list compact-plan';
+          state.plan.forEach(step => {
+            const item = document.createElement('li');
+            item.append(textNode('strong', step.intent), textNode('code', step.target_file));
+            plan.appendChild(item);
+          });
+          article.appendChild(plan);
+        }
+        if (row.waiting && Array.isArray(state.approval_payload?.plan)) {
+          article.appendChild(subtaskGate(row));
+        }
+        if (state.critic_verdict) {
+          const verdict = state.critic_verdict;
+          const critic = document.createElement('div');
+          critic.className = `subtask-critic ${verdict.verifiability !== 'ok' ? 'subtask-critic--warning' : ''}`;
+          critic.appendChild(textNode('strong', `Critic: ${verdict.approved ? 'approved' : 'rejected'} · ${verdict.verifiability || 'ok'}`));
+          const issues = Array.isArray(verdict.issues) ? verdict.issues.filter(Boolean) : [];
+          if (issues.length) critic.appendChild(textNode('p', issues.join('\n')));
+          article.appendChild(critic);
+        }
+        if (state.failure_reason) article.appendChild(textNode('p', state.failure_reason, 'failure-text'));
+        if (state.pr_url) {
+          const link = textNode('a', 'Open pull request', 'subtask-pr');
+          try {
+            const url = new URL(state.pr_url);
+            if (url.protocol === 'https:' && url.hostname === 'github.com') {
+              link.href = url.href; link.target = '_blank'; link.rel = 'noopener noreferrer';
+              article.appendChild(link);
+            }
+          } catch (_) {}
+        }
+        board.appendChild(article);
+      });
+    }
+
+    function subtaskGate(row) {
+      const wrap = document.createElement('div');
+      wrap.className = 'subtask-gate';
+      const note = document.createElement('textarea');
+      note.placeholder = 'Describe a revision, or leave blank to be asked';
+      note.setAttribute('aria-label', `Decision note for sub-task ${row.state?.spec_id || row.subtask_id}`);
+      const actions = document.createElement('div');
+      actions.className = 'action-row';
+      const status = textNode('p', '', 'inline-status');
+      for (const action of ['approve', 'reject']) {
+        const button = textNode('button', action === 'approve' ? 'Approve' : 'Reject',
+                                action === 'approve' ? 'primary-button' : 'danger-button');
+        button.type = 'button';
+        button.onclick = async () => {
+          actions.querySelectorAll('button').forEach(item => item.disabled = true);
+          status.textContent = 'Saving decision...';
+          try {
+            const response = await fetch(`/tickets/${TICKET_ID}/subtasks/${row.subtask_id}/${action}`, {
+              method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({note: note.value.trim()})
+            });
+            const data = await response.json();
+            if (!response.ok) throw new Error(errorMessage(data, 'Decision failed'));
+            await loadSubtasks();
+          } catch (error) {
+            status.textContent = error.message;
+            actions.querySelectorAll('button').forEach(item => item.disabled = false);
+          }
+        };
+        actions.appendChild(button);
+      }
+      wrap.append(note, actions, status);
+      return wrap;
+    }
+
     function renderDiagnosis(diagnosis) {
       const panel = byId('diagnosis-panel');
       panel.hidden = !diagnosis;
@@ -205,11 +447,66 @@
       if (!files.children.length) files.appendChild(textNode('span', 'None recorded', 'empty-state'));
     }
 
+    function renderCodeIntelligence(context) {
+      const panel = byId('code-intelligence-panel');
+      panel.hidden = !context?.hypothesis;
+      if (panel.hidden) return;
+      const confidence = Math.round(Number(context.confidence || 0) * 100);
+      const badge = byId('code-confidence');
+      badge.textContent = confidence + '% confidence';
+      badge.className = 'badge ' + (confidence < 50 ? 'badge--needs_human' : 'badge--done');
+      byId('code-hypothesis').textContent = context.hypothesis;
+      byId('code-investigation-type').textContent = String(context.investigation_type || 'general').replaceAll('_', ' ');
+      byId('code-snapshot').textContent = context.repo_snapshot_id || 'Unavailable';
+      byId('code-commit').textContent = context.commit_sha ? context.commit_sha.slice(0, 12) : 'Unavailable';
+      const files = byId('code-files');
+      files.replaceChildren();
+      (context.relevant_files || []).forEach(path => files.appendChild(textNode('code', path)));
+      const evidence = byId('code-evidence-list');
+      evidence.replaceChildren();
+      const verified = (context.verified_evidence || []).filter(item => item.verified).slice(0, 8);
+      if (!verified.length) {
+        evidence.appendChild(textNode('p', 'No verified evidence available.', 'empty-state'));
+        return;
+      }
+      verified.forEach(item => {
+        const row = document.createElement('div');
+        row.className = 'evidence-row';
+        row.append(
+          textNode('code', item.path + ':' + (item.start_line || item.line || 1)),
+          textNode('span', item.kind || item.relation || 'source')
+        );
+        evidence.appendChild(row);
+      });
+    }
+
+    let currentIntentGate = null;
+
+    function renderDecomposition(planRow, gateRow) {
+      const state = planRow?.state || {};
+      const panel = byId('decomposition-panel');
+      panel.hidden = !state.subtask_specs?.length;
+      // Two gates can be pending in this graph (intent, then plan); tell them
+      // apart by payload shape, not just "something is waiting".
+      currentIntentGate = (gateRow?.waiting && Array.isArray(gateRow.state?.approval_payload?.subtasks)) ? gateRow : null;
+      if (panel.hidden) return;
+      const list = byId('decomposition-list');
+      list.replaceChildren();
+      state.subtask_specs.forEach(spec => {
+        const item = document.createElement('li');
+        item.append(textNode('strong', spec.description), textNode('code', `${spec.type} · ${spec.repo}`));
+        list.appendChild(item);
+      });
+      byId('decomposition-reasoning').textContent = state.decomposition_reasoning || '';
+      byId('intent-gate-badge').hidden = !currentIntentGate;
+      byId('intent-approval-controls').hidden = !currentIntentGate;
+    }
+
     function renderPlan(planRow, gateRow) {
       const state = planRow?.state || {};
       const panel = byId('plan-panel');
       panel.hidden = !state.plan?.length;
-      currentGate = gateRow?.waiting ? gateRow : null;
+      currentGate = (gateRow?.waiting && Array.isArray(gateRow.state?.approval_payload?.plan)) ? gateRow : null;
       if (panel.hidden) return;
       const list = byId('plan-list');
       list.replaceChildren();
@@ -235,7 +532,8 @@
     function renderHistory(rows, activeId) {
       const target = byId('attempt-history');
       target.replaceChildren();
-      const previous = rows.filter(row => row.subtask_id !== activeId).reverse();
+      const previous = rows.filter(row => row.status === 'superseded' ||
+        (row.state?.orchestration_role === 'legacy' && row.subtask_id !== activeId)).reverse();
       if (!previous.length) {
         target.appendChild(textNode('p', 'No previous attempts.', 'empty-state'));
         return;
@@ -286,6 +584,55 @@
         }
         target.appendChild(renderCiStatus(row.subtask_id));
       }
+    }
+
+    function renderCritic(row) {
+      const state = row?.state || {};
+      const verdict = state.critic_verdict;
+      const empty = byId('critic-empty');
+      const result = byId('critic-result');
+      const decisionBadge = byId('critic-decision');
+      empty.hidden = Boolean(verdict);
+      result.hidden = !verdict;
+      if (!verdict) {
+        decisionBadge.textContent = 'Not reviewed';
+        decisionBadge.className = 'badge';
+        return;
+      }
+
+      const approved = verdict.approved === true;
+      decisionBadge.textContent = approved ? 'Approved' : 'Rejected';
+      decisionBadge.className = `badge badge--${approved ? 'done' : 'needs_human'}`;
+      byId('critic-decision-text').textContent = approved
+        ? 'Approved for pull request publication.'
+        : 'Rejected; the flow returned to the Executor for another attempt.';
+
+      const verifiability = verdict.verifiability || 'ok';
+      const verificationBadge = byId('critic-verifiability');
+      verificationBadge.textContent = verifiability;
+      verificationBadge.className = `badge critic-verifiability--${verifiability}`;
+
+      const warning = byId('critic-warning');
+      const warningText = {
+        no_tests: 'This repository has no usable tests, so the change could not be verified automatically.',
+        uncovered_change: 'The Critic found changed behavior that is not covered by tests.',
+      }[verifiability];
+      warning.hidden = !warningText;
+      warning.textContent = warningText || '';
+
+      const feedback = Array.isArray(verdict.issues) ? verdict.issues.filter(Boolean) : [];
+      byId('critic-feedback-text').textContent = feedback.length
+        ? feedback.join('\n')
+        : 'The completed change is consistent with the ticket, diagnosis, and available test results.';
+
+      const retries = Number(state.critic_retry_count || 0);
+      byId('critic-retries').textContent = `${retries} / ${MAX_AGENT_RETRIES}`;
+      const escalated = !approved && state.status === 'needs_human' && retries > MAX_AGENT_RETRIES;
+      const escalation = byId('critic-escalation');
+      escalation.hidden = !escalated;
+      escalation.textContent = escalated
+        ? `Escalated for human review after exceeding the retry cap. ${state.failure_reason || ''}`.trim()
+        : '';
     }
 
     // Local pytest result is shown per-step above; this is the OTHER, authoritative
@@ -378,7 +725,8 @@
         const response = await fetch(`/tickets/${TICKET_ID}/diagnose`, {method: 'POST'});
         const data = await response.json();
         if (!response.ok) throw new Error(errorMessage(data, 'Workflow failed'));
-        byId('diagnose-status').textContent = data.approval_status === 'pending' ? 'Plan ready for approval.' : data.status;
+        byId('diagnose-status').textContent = data.approval_status !== 'pending' ? data.status :
+          (data.diagnosis ? 'Plan ready for approval.' : 'Decomposition ready for confirmation.');
       } catch (error) {
         byId('diagnose-status').textContent = error.message;
       } finally {
@@ -387,14 +735,30 @@
       }
     }
 
+    async function decideIntent(action) {
+      if (!currentIntentGate) return;
+      const note = byId('intent-decision-note').value.trim();
+      byId('intent-approve-btn').disabled = true;
+      byId('intent-reject-btn').disabled = true;
+      byId('intent-approval-status').textContent = 'Saving decision...';
+      try {
+        const response = await fetch(`/tickets/${TICKET_ID}/subtasks/${currentIntentGate.subtask_id}/${action}`, {
+          method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({note})
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(errorMessage(data, 'Decision failed'));
+        byId('intent-approval-status').textContent = action === 'approve' ? 'Confirmed. Diagnosing...' : 'Rejected.';
+        await loadSubtasks();
+      } catch (error) {
+        byId('intent-approval-status').textContent = error.message;
+        byId('intent-approve-btn').disabled = false;
+        byId('intent-reject-btn').disabled = false;
+      }
+    }
+
     async function decide(action) {
       if (!currentGate) return;
       const note = byId('decision-note').value.trim();
-      if (action === 'reject' && !note) {
-        byId('approval-status').textContent = 'Enter a rejection note.';
-        byId('decision-note').focus();
-        return;
-      }
       byId('approve-btn').disabled = true;
       byId('reject-btn').disabled = true;
       byId('approval-status').textContent = 'Saving decision...';
@@ -404,7 +768,8 @@
         });
         const data = await response.json();
         if (!response.ok) throw new Error(errorMessage(data, 'Decision failed'));
-        byId('approval-status').textContent = action === 'approve' ? 'Approved. Flow resumed.' : 'Rejected. Human input requested.';
+        byId('approval-status').textContent = action === 'approve' ? 'Approved. Flow resumed.' :
+          (note ? 'Feedback received. Generating a revised plan.' : 'What should change? Add feedback and reject again.');
         await loadSubtasks();
       } catch (error) {
         byId('approval-status').textContent = error.message;
@@ -518,6 +883,14 @@
       byId('activity-feed').appendChild(makeEventRow(event));
     }
 
+    const budgetDisplay = document.createElement('p');
+    budgetDisplay.className = 'budget-strip';
+    document.querySelector('main').prepend(budgetDisplay);
+    async function loadTicketBudget() {
+      const response = await fetch(`/tickets/${TICKET_ID}/budget`);
+      if(response.ok) {const b=await response.json();budgetDisplay.textContent=`Ticket total: ${b.calls} calls · ${b.tokens} tokens · $${Number(b.est_cost_usd).toFixed(4)} estimated`;}
+    }
+    loadTicketBudget().catch(()=>{});
     const stream = new EventSource(`/stream/${TICKET_ID}`);
     let historyLoaded = false;
     stream.onopen = async () => {
@@ -529,6 +902,7 @@
     };
     stream.onmessage = event => {
       appendEvent(JSON.parse(event.data));
+      loadTicketBudget().catch(()=>{});
       loadSubtasks().catch(() => {});
     };
     stream.onerror = () => { byId('feed-status').textContent = 'Reconnecting...'; };
@@ -537,6 +911,8 @@
     byId('retry-btn').addEventListener('click', runDiagnosis);
     byId('approve-btn').addEventListener('click', () => decide('approve'));
     byId('reject-btn').addEventListener('click', () => decide('reject'));
+    byId('intent-approve-btn').addEventListener('click', () => decideIntent('approve'));
+    byId('intent-reject-btn').addEventListener('click', () => decideIntent('reject'));
     byId('repo-action').addEventListener('click', openRepoResolver);
     byId('repo-close').addEventListener('click', () => { byId('repo-panel').hidden = true; });
     loadSubtasks().catch(error => { byId('active-summary').textContent = error.message; });

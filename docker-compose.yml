@@ -16,5 +16,29 @@ services:
       timeout: 5s
       retries: 5
 
+  app:
+    build: .
+    container_name: agentic_sdlc_app
+    env_file: [.env]
+    environment:
+      DATABASE_URL: postgresql://agentic:localdevpassword@db:5432/agentic_sdlc
+      WORKSPACE_ROOT: /tmp/agentic-workspaces
+      UI_BASIC_AUTH_USERNAME: ${UI_BASIC_AUTH_USERNAME:-operator}
+      UI_BASIC_AUTH_PASSWORD: ${UI_BASIC_AUTH_PASSWORD:?Set UI_BASIC_AUTH_PASSWORD in .env}
+    ports: ["8000:8000"]
+    volumes:
+      - agentic_workspaces:/tmp/agentic-workspaces
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
 volumes:
   agentic_pgdata:
+  agentic_workspaces:

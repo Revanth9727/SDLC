@@ -62,9 +62,21 @@ route to the UI. Never loop unbounded. This is non-negotiable — it's the rule 
 protects your API budget and your sanity.
 
 **R-9. The guard runs after every agent, before proceeding.**
-The Orchestrator's deterministic guard performs, in order: (1) schema validation,
-(2) retry/loop-limit check, (3) budget check, (4) honest-failure exit. No agent output
-advances the flow until the guard passes it. See architecture.md §6.
+Two stages. **(a)** Schema validation happens inside the node itself — the agent's output
+is validated against its Pydantic model before the state ever reaches the guard node.
+**(b)** The deterministic guard node then performs, in order: (1) budget check,
+(2) honest-failure exit (accept a self-declared `needs_human`), (3) retry / loop-limit
+check (with a final fallback honest-fail if the cap is hit). So the full runtime order is
+**schema → budget → honest-fail → retry**. No agent output advances the flow until the
+guard passes it. See architecture.md §6.
+> Order notes: **budget before retry** is deliberate — if a ticket is already over its
+> call/cost budget, don't spend another attempt retrying; stop and escalate.
+> **Honest-fail before retry** is also deliberate — if the agent already said "I can't"
+> (R-10), route to the human instead of blindly retrying. The guard runs after the
+> reasoning/action nodes (diagnosis, step-planner, each execute step, freshness, critic,
+> and the safe-node-wrapped prepare/apply/publish/notify steps); it does NOT run after
+> pure human-decision nodes (human_gate, intent_gate, escalate, human_resolution,
+> apply_resolution), which carry no agent output to validate.
 
 **R-10. Agents must be allowed to say "I can't."**
 Each reasoning agent's output schema includes an explicit "unable / low-confidence"
@@ -133,8 +145,12 @@ create. Human review via PR is mandatory.
 
 **R-20. Freshness check before executing an approved plan.**
 Because diagnosis happens before human approval (possibly much earlier), verify the
-target files haven't changed since diagnosis before the Executor edits. If the repo
-moved, re-diagnose or flag — don't edit a stale codebase.
+target files haven't changed since diagnosis before the Executor edits. Use the snapshot
+recorded on the blackboard: the `diagnosed_commit_sha` / `repo_snapshot_id` that
+Code-Intelligence and Diagnosis were built on. Freshness = compare that commit to the
+current source; if the *affected files* changed, refresh Code-Intelligence + Diagnosis
+(re-run the slice) rather than editing a stale codebase; if they didn't, the approved plan
+still stands. Don't edit against a commit the plan was never validated on.
 
 **R-25. Jira status is dynamic and category-based; setting status is non-blocking.**
 Never hardcode a full status-name mapping. Jira exposes every status with a
@@ -253,12 +269,18 @@ technically loops (complements R-8's loop caps). Minimise calls structurally too
 solution reuse (R-29), merge cheap sequential steps into one call where it doesn't hurt
 modularity, cap context to relevant slices, and cache stable prompt prefixes.
 
-**R-35. I/O is async; the supervisor handles tickets concurrently.**
-All external I/O (Jira, GitHub, OpenAI, DB) uses async (`async`/`await`, `httpx.AsyncClient`,
-async DB access). FastAPI is already async — extend it through the stack so the poller/
-supervisor can process independent tickets concurrently without blocking on one slow
-call. This delivers most of the concurrency benefit without a second language. (True
-parallel *agent* execution is still Phase 10; async is the I/O foundation under it.)
+**R-35. I/O should be async; the supervisor handles tickets concurrently.**
+The *goal* is that external I/O (Jira, GitHub, OpenAI, DB) is non-blocking so the poller/
+supervisor processes independent tickets concurrently without stalling on one slow call.
+FastAPI is already async, and independent sub-tasks run concurrently via `asyncio.gather`.
+> **Current reality (honest status, as of the 1–10 audit):** this is only PARTIAL. The DB
+> layer uses a *synchronous* SQLAlchemy engine, and Jira/repo I/O use sync `httpx.Client`;
+> blocking calls are offloaded with `asyncio.to_thread` inconsistently (some sync calls run
+> directly inside `async def`). It works today, but "async throughout" is not yet true —
+> converting DB + HTTP to true async (or consistently offloading every blocking call) is
+> **remaining Phase 10 hardening**, not a done item. Don't claim full async in new work.
+(True parallel *agent* execution is Phase 10; consistent async I/O is the foundation still
+being finished under it.)
 
 **R-36. LLM response caching (built when agents exist, not before).**
 An exact + semantic response cache cuts repeat LLM cost: an `exact_cache` (SHA-256 of the
@@ -376,16 +398,6 @@ files, or DELETE files the fix requires — but it must never assume a filename 
 what the repo actually has; on "no tests collected" (pytest exit 5), treat as
 "no tests present," not a failure — create a test if the plan calls for it, else flag
 unverifiable (R-32). Distinguish exit 0 (pass) / 1 (real failure) / 5 (none collected).
-When writing that test, ground it in the REAL current content of the file(s) it
-covers (not just the diagnosis's prose summary) and, if one exists, an existing test
-file's real framework/conventions — a name recalled only from prose, not from the
-actual source, is how a written test ends up calling something that was never
-imported (NameError). A failure whose output names an import/name error gets a
-targeted repair hint, not a generic "pytest failed."
-
-Local pytest is the fast gate; when the repo has CI configured on the PR, CI is the
-**authoritative** check — if they disagree, CI wins. This never blocks the flow (CI
-is checked on demand, not polled/awaited); both results are surfaced in the UI.
 
 **R-47. Ticket comments are a two-way chat, not one-way narration.**
 The Jira ticket is a conversation: the tool narrates steps (R-40) AND reads + responds
@@ -393,7 +405,181 @@ to human replies (R-44), back and forth, like a chat thread. A human can ask, in
 or correct mid-flow; the tool reads it, responds (answer, or a gated proposal for
 commands), and continues — so the ticket reads as a genuine dialogue between the human
 and the tool, each aware of the other's messages (tool never treats its own messages as
-input; permission-checked; ambiguity → ask).
+input; permission-checked; ambiguity → ask). Comment classification uses the CHEAP model
+(MODEL_CHEAP), never the strong one — it's simple intent detection, not reasoning (R-33);
+only actual re-planning from feedback uses the planner's tier.
+
+**R-48. The approval gate is a feedback loop: approve / reject-and-re-plan / revise.**
+At the human gate, a decision (from the UI OR a Jira comment — both drive the SAME logic)
+can be:
+- **APPROVE** → resume the flow (execute the plan).
+- **REJECT** → do NOT dead-stop. Re-plan: if the human gave a reason/feedback, generate a
+  NEW plan addressing it; if no reason was given, ask "what should change?" then re-plan
+  from the answer. The new plan returns to the gate for approval.
+- **REVISE / SUGGESTION** (e.g. "reject, but also handle None" / "change step 2 to use
+  try/except") → treat as feedback: generate a new plan incorporating the suggestion,
+  back to the gate.
+- **QUESTION** → answer it, stay at the gate (still awaiting decision).
+Comment-based decisions match the pending gate for that ticket and call the identical
+resume/re-plan path as the UI buttons — never a separate code path, never double-apply.
+Permission-checked (R-38); re-planning is bounded (R-8) so it can't loop forever.
+
+**R-49. The user declares which Jira statuses to use; categories remain the safety net.**
+Extends R-25 (does not replace it). On first run, a setup page lets the user list the
+exact statuses their project uses and assign each one a MEANING (its role in the flow:
+ready-to-pick-up, work-started, in-review, blocked/needs-human, done). The tool then
+moves tickets ONLY among these user-declared statuses. Two layers, in order:
+- **Declared map is the target.** When the tool performs a transition (claim → work
+  started, PR open → in-review, escalation → blocked), it moves the ticket to the
+  user's declared status for that meaning.
+- **Categories stay underneath (R-25).** The tool auto-suggests each status's meaning
+  from its Jira statusCategory, and the user confirms/corrects it. Any status the user
+  did NOT declare is still classified by category so nothing crashes; a status whose
+  category can't be resolved at all is still "unknown" → comment + escalate (R-28).
+- **Resolution order for any transition: map → category → comment-and-leave.** First use
+  the declared status for that meaning; if the map has none, fall back to the category
+  logic (R-25); if THAT also finds no target, do not force anything — comment on the
+  ticket ("couldn't move to <meaning> — no matching status") and leave the ticket where
+  it is. The tool only "gives up" (comments) when BOTH map and category come up empty;
+  it never crashes and never silently drops the move.
+Setting status remains NON-BLOCKING (R-11): if a declared target status isn't reachable,
+skip with a warning and leave the ticket where it is — never fail the actual work. A
+human comment can drive a status change only THROUGH the gate (R-48): the comment
+triggers the action, and the action's stage-boundary sets the declared status — a
+comment never sets status directly. Ticket intake/picking (R-27) is unchanged.
+Token persistence (R-42) applies here too: a UI-entered GitHub token is saved encrypted
+per repo, so the user is not re-prompted for a repo that already has a working token.
+Built in Phase 5.6.
+
+---
+
+## H. Code intelligence (understanding the repo before changing it)
+
+> Built in **Phase 11** (its own track, after the spine is proven). These rules govern
+> how the tool understands a codebase — especially a large one — without reading it
+> blindly or exploding cost. They extend, never replace, the isolation and
+> deterministic-vs-agent rules above.
+
+**R-50. Repository intelligence is a persistent, per-repo, DETERMINISTIC knowledge layer.**
+This is the THIRD storage layer, separate from the per-sub-task blackboard (§5) and the
+solved-ticket memory (memory.md). It holds what the *code is*: file inventory, symbols,
+imports/calls/references, SQL reads/writes, code chunks + embeddings, and a knowledge
+graph of proven relationships. All of it is built by **deterministic parsing (AST,
+static analysis, SQL parsing, embedding calls) — never by an LLM deciding edges.**
+- **Persistent + keyed by repo, REF, and indexed commit.** Key intelligence by
+  `repo + ref (branch) + commit_sha`, not repo+commit alone — `main`, `release/2026`, and
+  a feature branch can hold different code, and a ticket may target a specific ref. Model
+  it as a **RepositorySnapshot** (repo_id, ref, commit_sha, indexed_at, status). You need
+  not keep a full graph per branch — use the closest snapshot + diff — but ref-awareness
+  is part of the design now, not an afterthought.
+- **Incremental via git diff.** On a new commit, reparse only changed files, update their
+  symbols/embeddings/edges, delete stale ones; never a full re-index.
+- **Progressive / lazy — but embeddings are NOT lazy.** Do NOT fully graph a huge repo
+  before a tiny ticket. BUT global semantic discoverability must exist at cold-index:
+  embed *all searchable code chunks* up front (otherwise, in an ugly repo with no
+  greppable names, you can't find the area you'd need to embed — a chicken-and-egg trap).
+  Only the *deeper* work stays lazy: expensive cross-file analysis, deep data-flow,
+  inferred semantics, graph expansion beyond the core edges.
+- **Provenance on every stored fact.** Each fact/edge records where it came from: source
+  file + line range, the extractor that produced it (e.g. `sql_parser`, `ast`), the
+  commit, a confidence, and PROVEN-vs-INFERRED type. Six months later, safe updates depend
+  on knowing what evidence created a piece of knowledge.
+- **Facts before inference.** Proven edges are fact; AI-suggested edges are marked
+  `inferred` with confidence + evidence, never mixed with proven ones.
+- **Graph = navigation, code = evidence.** The graph points where to look; the tool
+  ALWAYS opens and verifies the real source before acting or answering.
+- **Exclusions (indexing policy).** Respect `.gitignore` plus known generated/vendor dirs
+  (`node_modules/`, `vendor/`, `dist/`, `build/`, `target/`, `generated/`, `coverage/`,
+  `.git/`), binary detection, a max file size, minified/lock-file detection — with
+  per-repo overrides. Indexing garbage explodes cost and wrecks retrieval quality.
+- **One index job per repo/ref at a time (concurrency).** If two tickets hit the same
+  repo needing an update, they must not both mutate the index. Use a per-repo/ref indexing
+  lock or an `index_jobs` table (repo_id, ref, target_sha, status); the second ticket
+  waits for or reuses the first job. No interleaved edge writes.
+- **Explicit index states + safe recovery.** An index is `NEW / INDEXING / READY /
+  PARTIAL / STALE / FAILED / UPDATING` — never mark a half-built index READY. Prefer
+  building a new snapshot then **atomic swap** (build → validate → swap active), so a
+  ticket never reads a half-updated graph. A crash mid-index leaves `PARTIAL/FAILED`, not
+  a corrupt READY.
+- **Isolation + privacy.** Repo intelligence is derived from the *shared source repo*,
+  not from any ticket's private state, so sharing it across tickets does NOT break
+  sub-task isolation (R-1, R-28). But a ticket may only read intelligence for a repo it
+  is authorized to touch (private repos are access-scoped), and the layer stores
+  structure/paths only — never secrets or credential-bearing code bodies (extends M-3).
+
+**R-51. One code-intelligence AGENT investigates; the capabilities are TOOLS, not agents.**
+The many retrieval/analysis capabilities — exact search (`search_exact`/grep), semantic
+search (`search_semantic`), `find_symbol`, `get_callers`, `get_callees`,
+`get_references`, `get_reads_writes`, `get_file`, `get_diff` — are DETERMINISTIC tools
+(R-5/R-6). Exactly ONE reasoning agent (the 7th agent, an *investigator*) orchestrates
+them: decide what kind of investigation the ticket needs → search (exact + hybrid) →
+rerank to a shortlist → inspect → follow callers/callees → form a hypothesis → verify
+against source → return relevant files, functions, execution path, and a confidence.
+Its result is written to the blackboard as the validated `code_context` field (R-1: the
+blackboard is the only channel — Code-Intelligence never hands Diagnosis anything by a
+side path), including the `repo_snapshot_id`/commit it was built on for freshness (R-20).
+Do NOT create a LexicalAgent / EmbeddingAgent / GraphAgent / SQLAgent — that is
+over-engineering; those are tools. The investigator **feeds Diagnosis** (it supplies the
+verified slice + execution path; Diagnosis reasons about the fix from that), runs under
+the guard (R-9), returns Pydantic-validated output (R-2), is **bounded** (R-8: a hard
+cap on investigation steps, then return the best hypothesis at lower confidence — an
+honest exit per R-10), and respects the per-ticket budget (R-34).
+
+Additional requirements this agent and its tools must honour:
+- **Deterministic reranker (not an LLM).** Candidate fusion → dedupe → rerank must use a
+  defined deterministic score (e.g. lexical score + semantic score + symbol-match +
+  graph-proximity + file-type relevance, or reciprocal-rank fusion), NOT a hidden LLM
+  call. This protects the cost model (R-34).
+- **Config/build/dependency files are first-class.** `pom.xml`, `build.gradle`,
+  `package.json`, `requirements.txt`, `pyproject.toml`, `Dockerfile`, CI workflows,
+  `application.yml`/properties, IaC — treated as understood artifacts (dependencies,
+  versions, build/test commands, runtime config), not arbitrary text. Many tickets
+  ("service breaks after upgrading library X") live almost entirely here.
+- **Static-analysis blind spots are acknowledged, not hidden.** Reflection, dynamic
+  imports, runtime DI, config-driven class names, generated/stored-proc SQL, plugin
+  wiring — static parsing can't fully resolve these. When evidence is incomplete the agent
+  inspects config/tests/build wiring, and if still uncertain returns LOW confidence rather
+  than pretending the graph is complete (honest failure, R-10). The graph must never be
+  assumed more complete than it is.
+- **Symbol resolution evolves.** Lexical `get_callers/callees/references` is fine for the
+  first prototype but is weak (grepping `save()` doesn't prove a call). The intended
+  evolution is AST / language-aware symbol resolution (e.g. tree-sitter / language
+  servers) with lexical fallback.
+- **Graph is not only a call graph.** The edge schema is designed to grow beyond
+  CALLS/IMPORTS/REFERENCES/READS/WRITES/CONTAINS to EXTENDS, IMPLEMENTS, OVERRIDES,
+  ROUTES_TO/HANDLES, PUBLISHES_TO/CONSUMES_FROM, EXECUTES/INVOKES, USES_CONFIG,
+  DEPENDS_ON, TESTS. Build the core edges first; don't hardcode assumptions that block the
+  rest.
+- **Shared across the existing flow, not just Diagnosis.** The investigator produces
+  `code_context` for Diagnosis (primary path), but the deterministic tools are shared
+  infrastructure the other existing agents call where it helps: Executor checks
+  callers/references before a surgical edit (don't break callers), Critic can check for
+  missed callers/references, and the integration stage's cross-sub-task breakage check uses
+  the same graph/reference tools. Phase 11 is the existing flow gaining a shared brain — not
+  a subsystem only one agent talks to.
+
+**R-53. One shared publish step; one open PR per ticket; check BEFORE any LLM calls.**
+All work that could open a pull request — whether it came from a normal ticket flow or a
+human comment-command — goes through ONE shared publish step (a single "door"). There are
+never two separate PR-opening code paths that can drift or be bypassed. Inside that step,
+the **one-open-PR-per-ticket** rule is enforced, and the check happens **at the very front,
+before spending any LLM calls** (so a request against a ticket that already has an open PR
+costs nothing until the human decides — R-34).
+- **No open PR for this ticket** → proceed and open one. (Open-PR status is read from the
+  `pr_links` table + PR-state matrix built in Phase 5.5.)
+- **An open PR already exists** → STOP before any reasoning/LLM work, post a **summary of
+  the existing PR**, and **ASK the human** what to do: keep it, or replace it. NEVER assume
+  the existing PR is complete/good and silently skip, and NEVER silently replace it. The
+  human decides (propose-don't-auto-act, R-30/R-48).
+- **Replace path (both supported):** the human may close the PR on GitHub (auto-detected
+  via the PR-state matrix, which lifts the block), OR use a "redo PR" button/comment-command
+  → the tool closes the old PR and opens a fresh one.
+- **After a PR is accepted (merged)** → the code has changed, so re-read it (freshness,
+  R-20) and make the next changes **incrementally** on top of the merged result — never
+  stack a second PR on soon-to-be-stale code.
+This replaces the older split where a "legacy"/comment path published via separate
+`publish_pr`/`notify_pr` nodes; both paths now share the one publish step. Built as a
+pre-Phase-11 consolidation.
 
 ---
 
@@ -429,4 +615,6 @@ not a whole-system crash.
 - [ ] Edits are SEARCH/REPLACE, one-match-only, guarded, reversible (R-14–R-16)
 - [ ] No secret in code or logs; model swappable via env (R-17, R-18)
 - [ ] Never touches main; PR only; freshness-checked (R-19, R-20)
+- [ ] Repo intelligence is deterministic + per-repo + incremental; graph verified against source (R-50)
+- [ ] Code-intelligence capabilities are tools; exactly one investigator agent, bounded + guarded (R-51)
 - [ ] Phase has passing tests + a visible verification (R-22)

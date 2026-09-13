@@ -9,20 +9,23 @@ from app.agents.router import model_tier
 from app.agents.state import BudgetUsed, SubtaskState
 from app.config import settings
 from app.core.failures import describe_failure
+from app.core.code_impact import impact_warning, inspect_impacts, merge_impacts
 from app.events import log_event
-from app.tools.edit_applier import EditReport, apply_edits
+from app.tools.edit_applier import EditMatch, EditReport, apply_edits
 from app.tools.edit_guard import check_edit
 from app.tools.repo_tool import RepoTool
+from app.tools.code_search import CodeSearchTool
 from app.tools.test_import_validator import validate_test_imports
 from app.tools.test_runner import TestResult, run_tests
 
 
 class ExecutorAgent:
-    def __init__(self, llm=None, repo_tool=None, test_runner=run_tests, emit=log_event):
+    def __init__(self, llm=None, repo_tool=None, test_runner=run_tests, emit=log_event, code_search=None):
         self.llm = llm or LLMClient()
         self.repo_tool = repo_tool or RepoTool()
         self.test_runner = test_runner
         self.emit = emit
+        self.code_search = code_search or CodeSearchTool(repo_tool=self.repo_tool)
 
     async def event(self, state, stage, message):
         await self.emit(ticket_id=state.ticket_id, subtask_id=state.subtask_id,
@@ -68,8 +71,11 @@ class ExecutorAgent:
             # Count deltas so usage remains correct after a restart with an empty
             # in-process LLM usage cache.
             for attempt in range(settings.max_agent_retries + 1):
-                if state.budget_used.calls >= settings.ticket_call_budget or state.budget_used.est_cost_usd >= settings.ticket_cost_budget_usd:
-                    return self.fail(state, 'Ticket budget exhausted before execution')
+                from app.core.budget import usage, budget_reason
+                saved = usage(state.ticket_id)
+                reason = budget_reason(saved or state.budget_used.model_dump(), saved.get('limits') if saved else None)
+                if reason:
+                    return self.fail(state, reason)
                 usage_before = self.llm.get_usage(state.ticket_id)
                 try:
                     proposal = await asyncio.to_thread(self.llm.complete_json, _SYSTEM,
@@ -81,7 +87,31 @@ class ExecutorAgent:
                     await self.event(state, 'edit_proposed', proposal.model_dump_json())
                     if proposal.unable_reason:
                         return self.fail(state, proposal.unable_reason)
-                    after, report = apply_edits(before, proposal.blocks)
+                    if step.action == 'create':
+                        if proposal.full_content is None:
+                            raise ValueError(
+                                f"Creating {step.target_file} requires full_content, not SEARCH/REPLACE blocks"
+                            )
+                        after = proposal.full_content
+                        report = EditReport(matches=[
+                            EditMatch(block=0, start=0, end=0, tier='create')
+                        ])
+                    else:
+                        if not proposal.blocks:
+                            raise ValueError(
+                                f"Editing {step.target_file} requires SEARCH/REPLACE blocks, not full_content"
+                            )
+                        after, report = apply_edits(before, proposal.blocks)
+                        impacts = await asyncio.to_thread(
+                            inspect_impacts, state, step.target_file, before,
+                            [block.search for block in proposal.blocks], self.code_search,
+                        )
+                        merge_impacts(state, impacts)
+                        await self.event(state, 'impact_checked',
+                                         f"Checked callers/references for {len(impacts)} changed symbol(s)")
+                        warning = impact_warning(impacts)
+                        if warning:
+                            await self.event(state, 'impact_warning', warning)
                     check_edit(step.target_file, before, after)
                     await asyncio.to_thread(self.repo_tool.write_execution_file, checkout, step.target_file, after)
                     await self.event(state, 'edit_applied', report.model_dump_json())
@@ -214,9 +244,14 @@ class ExecutorAgent:
         return state
 
 
-_SYSTEM = """Apply only this approved step to the supplied file. Return surgical
-SEARCH/REPLACE blocks quoting existing code, not a full-file rewrite or shell
-commands. For a missing empty file only, a single empty search may create it.
+_SYSTEM = """Apply only this approved step to the supplied file. The step's action
+is authoritative and was checked against the real repository immediately before
+this call:
+- For action="create", return the complete new file in full_content. Return no
+  SEARCH/REPLACE blocks because the target does not exist.
+- For action="edit", return surgical SEARCH/REPLACE blocks quoting existing code.
+  Return no full_content and do not rewrite the whole file.
+Never return shell commands.
 Use repair_feedback to correct a failed match, syntax error or test failure.
 Do not change the step's scope or invent requirements. If you cannot do this safely,
 return no blocks and a specific unable_reason. Otherwise unable_reason is null.
