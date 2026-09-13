@@ -78,6 +78,14 @@
       </div>
     </section>
 
+    <section id="repo-overview-phase" class="workflow-section" hidden aria-live="polite">
+      <div class="section-heading">
+        <h2>Understanding the repository...</h2>
+        <span id="repo-overview-badge" class="badge badge--running">In progress</span>
+      </div>
+      <p id="repo-overview-summary" class="supporting-text">Building a lightweight map of files and modules.</p>
+    </section>
+
     <section id="decomposition-panel" class="workflow-section" hidden>
       <div class="section-heading"><h2>Decomposition</h2><span id="intent-gate-badge" class="badge badge--awaiting_approval" hidden>Awaiting confirmation</span></div>
       <ol id="decomposition-list" class="plan-list"></ol>
@@ -182,6 +190,7 @@
     const ACTIVE_STATUSES = new Set(['running', 'waiting', 'pending']);
     let currentGate = null;
     let emptyEl = document.getElementById('feed-empty');
+    const eventsBySubtask = new Map();
     const byId = id => document.getElementById(id);
     const textNode = (tag, text, className = '') => {
       const node = document.createElement(tag);
@@ -242,6 +251,7 @@
                         (b.state?.orchestration_index ?? Number.MAX_SAFE_INTEGER));
       const coordinator = newest.find(row => row.state?.orchestration_role === 'coordinator');
       renderActive(active, workRows);
+      renderRepoOverview(coordinator?.state?.repo_overview || []);
       renderDecomposition(coordinator || display, active?.waiting ? active : null);
       renderSubtasks(workRows);
       const multi = workRows.length > 0;
@@ -270,6 +280,34 @@
       const canStart = HAS_REPO && (!active || freshPending) && !['needs_human', 'failed', 'in_review', 'done'].includes(latest?.status);
       byId('diagnose-btn').hidden = !canStart;
       byId('diagnose-btn').disabled = false;
+    }
+
+    function renderRepoOverview(overviews) {
+      if (!Array.isArray(overviews) || !overviews.length) return;
+      const panel = byId('repo-overview-phase');
+      panel.hidden = false;
+      byId('repo-overview-badge').textContent = 'Complete';
+      byId('repo-overview-badge').className = 'badge badge--done';
+      byId('repo-overview-summary').textContent = overviews.map(item => {
+        const modules = Array.isArray(item.modules) && item.modules.length ? ` Modules: ${item.modules.join(', ')}.` : '';
+        return `${item.repo}: ${Number(item.file_count || 0).toLocaleString()} files mapped.${modules}`;
+      }).join(' ');
+    }
+
+    function renderRepoOverviewEvent(event) {
+      if (event.agent !== 'repo_overview') return;
+      const panel = byId('repo-overview-phase');
+      const badge = byId('repo-overview-badge');
+      panel.hidden = false;
+      if (event.stage === 'started') {
+        badge.textContent = 'In progress';
+        badge.className = 'badge badge--running';
+        byId('repo-overview-summary').textContent = 'Building a lightweight map of files and modules.';
+      } else if (event.stage === 'failed') {
+        badge.textContent = 'Needs attention';
+        badge.className = 'badge badge--needs_human';
+        byId('repo-overview-summary').textContent = event.message;
+      }
     }
 
     function renderActive(active, workRows = []) {
@@ -348,6 +386,7 @@
         const dependencies = (state.depends_on || []).map(id => labels.get(id) || id);
         meta.textContent = `${state.repo || 'No repo'} · ${dependencies.length ? `Depends on ${dependencies.join(', ')}` : 'No dependencies'}`;
         article.appendChild(meta);
+        renderSubtaskTimeline(article, row);
         if (row.status === 'queued') article.appendChild(textNode('p', 'Queued until earlier dependencies finish.', 'empty-state'));
         if (row.status === 'integration_pending') article.appendChild(textNode('p', 'Critic approved. Waiting for whole-ticket integration before PR publication.', 'integration-pending-note'));
         if (state.code_context?.hypothesis) {
@@ -399,6 +438,80 @@
         }
         board.appendChild(article);
       });
+    }
+
+    function rememberSubtaskEvent(event) {
+      if (!event.subtask_id) return;
+      const events = eventsBySubtask.get(event.subtask_id) || [];
+      const duplicate = events.some(item => item.ts === event.ts && item.agent === event.agent &&
+                                           item.stage === event.stage && item.message === event.message);
+      if (!duplicate) events.push(event);
+      events.sort((left, right) => String(left.ts || '').localeCompare(String(right.ts || '')));
+      eventsBySubtask.set(event.subtask_id, events);
+    }
+
+    function renderSubtaskTimeline(article, row) {
+      const events = eventsBySubtask.get(row.subtask_id) || [];
+      if (!events.length && row.status === 'queued') return;
+      const section = document.createElement('section');
+      section.className = 'subtask-timeline';
+      const heading = document.createElement('div');
+      heading.className = 'subtask-timeline__heading';
+      heading.append(
+        textNode('strong', ACTIVE_STATUSES.has(row.status) ? 'Live steps' : 'Run timeline'),
+        textNode('span', events.length ? `${events.length} event${events.length === 1 ? '' : 's'}` : 'Starting...', 'field-label')
+      );
+      section.appendChild(heading);
+      const list = document.createElement('ol');
+      list.className = 'subtask-timeline__list';
+      const visible = events.slice(-20);
+      visible.forEach(event => {
+        const item = document.createElement('li');
+        item.className = `subtask-timeline__item timeline--${(event.agent || 'system').toLowerCase()}`;
+        const copy = document.createElement('div');
+        copy.append(
+          textNode('strong', timelineLabel(event)),
+          textNode('p', timelineMessage(event))
+        );
+        item.append(copy, textNode('time', fmtTime(event.ts)));
+        list.appendChild(item);
+      });
+      if (!visible.length) {
+        const item = textNode('li', 'Waiting for the first step...', 'subtask-timeline__empty');
+        list.appendChild(item);
+      }
+      section.appendChild(list);
+      article.appendChild(section);
+    }
+
+    function timelineLabel(event) {
+      const names = {
+        repo_index: 'Reading repository', code_search: 'Searching code',
+        code_intelligence: 'Investigating', diagnosis: 'Diagnosing',
+        step_planner: 'Planning', executor: 'Editing and testing', critic: 'Reviewing',
+        freshness: 'Checking freshness', approval: 'Approval', guard: 'Safety check',
+        orchestrator: 'Orchestrating', memory: 'Checking memory', jira: 'Updating Jira',
+        workspace: 'Workspace'
+      };
+      const agent = names[event.agent] || String(event.agent || 'System').replaceAll('_', ' ');
+      const stage = String(event.stage || '').replaceAll('_', ' ');
+      return stage ? `${agent} · ${stage}` : agent;
+    }
+
+    function timelineMessage(event) {
+      const message = String(event.message || '');
+      if (!message.trim().startsWith('{')) return message;
+      try {
+        const payload = JSON.parse(message);
+        if (event.agent === 'repo_index') {
+          if (payload.mode) return `${payload.mode === 'cold' ? 'Cold' : 'Incremental'} index started for ${payload.repo || 'repository'}.`;
+          if (payload.indexed != null) return `Mapped ${payload.indexed} of ${payload.total} files.`;
+          if (payload.files != null) return `Repository map ready with ${payload.files} files.`;
+          if (payload.changed) return `Updated ${payload.reparsed || 0} changed files.`;
+        }
+        if (payload.tool) return `${String(payload.tool).replaceAll('_', ' ')} completed.`;
+      } catch (_) {}
+      return message;
     }
 
     function subtaskGate(row) {
@@ -879,6 +992,7 @@
       return row;
     }
     function appendEvent(event) {
+      rememberSubtaskEvent(event);
       if (emptyEl) { emptyEl.remove(); emptyEl = null; }
       byId('activity-feed').appendChild(makeEventRow(event));
     }
@@ -898,10 +1012,15 @@
       if (historyLoaded) return;
       historyLoaded = true;
       const response = await fetch(`/tickets/${TICKET_ID}/events`);
-      if (response.ok) (await response.json()).forEach(appendEvent);
+      if (response.ok) {
+        (await response.json()).forEach(appendEvent);
+        loadSubtasks().catch(() => {});
+      }
     };
     stream.onmessage = event => {
-      appendEvent(JSON.parse(event.data));
+      const data = JSON.parse(event.data);
+      appendEvent(data);
+      renderRepoOverviewEvent(data);
       loadTicketBudget().catch(()=>{});
       loadSubtasks().catch(() => {});
     };

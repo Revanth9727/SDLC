@@ -97,7 +97,7 @@ def _guard(state: SubtaskState) -> SubtaskState:
 
 def build_graph(agent=None, *, planner=None, decomposer=None, investigator=None, checkpointer, jira=None, executor=None, critic=None,
                 publisher=None, gate_store=None, memory_search=None, memory_writer=None,
-                activity_check=require_active, repo_tool=None):
+                activity_check=require_active, repo_tool=None, overview_builder=None):
     workflow_repo_tool = (
         repo_tool
         or getattr(agent, "repo_tool", None)
@@ -142,6 +142,36 @@ def build_graph(agent=None, *, planner=None, decomposer=None, investigator=None,
 
     async def decompose(raw):
         return await run_agent(raw, "planner", decomposer, PlannerAgent)
+
+    async def repo_overview(raw):
+        state = SubtaskState.model_validate(raw)
+        state.guard_node, state.guard_error = "repo_overview", None
+        await _event(state, "repo_overview", "started", "Understanding the repository...")
+        try:
+            if overview_builder is not None:
+                build = overview_builder
+            elif decomposer is not None:
+                # Dependency-injected graph tests do not own real GitHub checkouts.
+                build = lambda repos, _workspace: [
+                    {"repo": repo, "ref": "test", "commit_sha": "test", "source": "injected",
+                     "snapshot_id": None, "file_count": 0, "excluded_count": 0,
+                     "files": [], "directories": [], "modules": []}
+                    for repo in repos
+                ]
+            else:
+                from app.repo_intelligence.overview import build_repo_overviews
+                build = lambda repos, workspace: build_repo_overviews(
+                    repos, workspace, repo_tool=workflow_repo_tool,
+                )
+            state.repo_overview = await asyncio.to_thread(build, state.confirmed_repos, state.subtask_id)
+            summary = [{"repo": item["repo"], "files": item["file_count"],
+                        "modules": item["modules"], "source": item["source"]}
+                       for item in state.repo_overview]
+            await _event(state, "repo_overview", "done", json.dumps(summary))
+        except Exception as exc:
+            state.guard_error = describe_failure("Understanding the repository", exc)
+            await _event(state, "repo_overview", "failed", state.guard_error)
+        return state.model_dump(mode="json")
 
     async def diagnose(raw):
         if agent is not None:
@@ -591,7 +621,7 @@ def build_graph(agent=None, *, planner=None, decomposer=None, investigator=None,
         return wrapped
 
     graph = StateGraph(dict)
-    for name, node in [("planner", decompose), ("reuse_check", reuse_check),
+    for name, node in [("repo_overview", repo_overview), ("planner", decompose), ("reuse_check", reuse_check),
                        ("code_intelligence", investigate), ("diagnosis", diagnose),
                        ("step_planner", plan),
                        ("guard", guard), ("human_resolution", human_resolution), ("apply_resolution", apply_resolution),
@@ -605,9 +635,10 @@ def build_graph(agent=None, *, planner=None, decomposer=None, investigator=None,
                        {'prepare_intent_confirmation', 'apply_intent_decision',
                         'prepare_approval', 'apply_decision', 'publish'} else node)
     graph.set_conditional_entry_point(
-        lambda raw: "reuse_check" if raw.get("orchestration_role") == "work" else "planner",
-        {"planner": "planner", "reuse_check": "reuse_check"},
+        lambda raw: "reuse_check" if raw.get("orchestration_role") == "work" else "repo_overview",
+        {"repo_overview": "repo_overview", "reuse_check": "reuse_check"},
     )
+    graph.add_edge('repo_overview', 'guard')
     graph.add_edge('planner', 'guard')
     graph.add_edge('reuse_check', 'guard')
     graph.add_edge('code_intelligence', 'guard')
@@ -626,7 +657,7 @@ def build_graph(agent=None, *, planner=None, decomposer=None, investigator=None,
             return END
         if node == 'critic' and raw.get('orchestration_role') == 'work' and raw['status'] == 'integration_pending':
             return END
-        return {'planner': 'prepare_intent_confirmation',
+        return {'repo_overview': 'planner', 'planner': 'prepare_intent_confirmation',
                 'prepare_intent_confirmation': 'intent_gate', 'apply_intent_decision': 'reuse_check',
                 'reuse_check': 'prepare_approval' if raw['reuse_source'] else 'code_intelligence',
                 'code_intelligence': 'diagnosis',

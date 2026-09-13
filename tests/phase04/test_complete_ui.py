@@ -38,6 +38,8 @@ def test_ticket_detail_contains_complete_state_driven_interface():
         "critic_retry_count", "MAX_AGENT_RETRIES", "renderCritic(display)",
         "overall-progress", "subtask-board", "renderSubtasks(workRows)",
         "subtaskGate(row)", "Sequential by dependency",
+        "eventsBySubtask", "rememberSubtaskEvent(event)",
+        "renderSubtaskTimeline(article, row)", "Live steps",
     ):
         assert control in source
     assert "active?.waiting" in source

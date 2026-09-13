@@ -35,6 +35,9 @@ class SubtaskState(BaseModel):
     # The ticket's full confirmed repo list (§5c) — the Planner's input; it assigns
     # each sub-task exactly one of these (R-26), never a repo outside this list.
     confirmed_repos: list[str] = Field(default_factory=list)
+    # Ticket-level, deterministic repository shape supplied to the Planner.
+    # Deep code evidence remains isolated in each work state's code_context.
+    repo_overview: list[dict[str, Any]] = Field(default_factory=list)
 
     # Planner (architecture.md §7a, ai_rules.md R-26/R-30/R-10): the full
     # decomposition it recorded, even though only the first sub-task (this state)

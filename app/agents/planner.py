@@ -61,6 +61,7 @@ class PlannerAgent:
                 json.dumps({
                     "ticket_description": state.description,
                     "confirmed_repos": state.confirmed_repos,
+                    "repository_overview": state.repo_overview,
                 }),
                 DecompositionResult,
                 tier=model_tier("planner", ambiguous=len(state.confirmed_repos) > 1),
@@ -123,6 +124,11 @@ nothing to decide. If it has several and it is genuinely unclear which repo a
 sub-task belongs to, do NOT guess: return CannotDecompose explaining the
 ambiguity (which sub-task, which candidate repos) instead of a decomposition. A
 sub-task's repo must always be one of confirmed_repos, never invented.
+
+repository_overview contains deterministic file inventory and folder/module
+structure for the confirmed repos. Use this lightweight map to recognize real
+module boundaries while splitting. It is structural context, not proof of code
+behavior; do not invent implementation details from filenames alone.
 
 Explain your split briefly in reasoning. If the ticket's intent is too unclear to
 decompose at all, return CannotDecompose with a reason and null subtasks.

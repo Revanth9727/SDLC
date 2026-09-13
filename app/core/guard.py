@@ -47,7 +47,13 @@ def validate_output(previous: SubtaskState, output, node: str) -> SubtaskState:
         if getattr(state, field) != getattr(previous, field):
             raise ValueError(f'Agent changed protected identity: {field}')
     if state.status == 'running':
-        if node == 'planner':
+        if node == 'repo_overview':
+            if not state.repo_overview or {item.get('repo') for item in state.repo_overview} != set(state.confirmed_repos):
+                raise ValueError('Repository overview does not cover the confirmed repos')
+            if any(not isinstance(item.get('files'), list) or not isinstance(item.get('directories'), list)
+                   for item in state.repo_overview):
+                raise ValueError('Repository overview has an invalid inventory shape')
+        elif node == 'planner':
             DecompositionResult.model_validate({'subtasks': state.subtask_specs, 'reasoning': state.decomposition_reasoning})
             if state.repo not in state.confirmed_repos:
                 raise ValueError('Planner assigned a repo outside the confirmed list')
