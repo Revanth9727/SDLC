@@ -581,6 +581,24 @@ This replaces the older split where a "legacy"/comment path published via separa
 `publish_pr`/`notify_pr` nodes; both paths now share the one publish step. Built as a
 pre-Phase-11 consolidation.
 
+**R-54. A light repo overview runs BEFORE the Planner splits; deep reading stays per sub-task.**
+Before the Planner decomposes a ticket, a **cheap, deterministic** pass produces a
+repo *overview* — file inventory + folder/module structure (reuses the cold-index
+inventory; NOT embeddings, NOT the full graph, NOT investigation). The Planner uses this
+overview to split the ticket more sensibly (e.g. recognising module boundaries). This is a
+light "understand the shape first" step — explicitly NOT full repo reading before the
+split, which would reintroduce the big-repo cost the per-sub-task design avoids. The
+**deep** code understanding (Code-Intelligence investigation, R-50/R-51) stays scoped to
+each sub-task, unchanged. The overview is deterministic (no LLM) and must be **visible**:
+an "Understanding the repository…" phase shown before the sub-task cards appear (R-45).
+
+**R-55. Each sub-task shows its own live timeline while running.**
+Extends R-45. A sub-task card must not sit on a bare "running" label while a node
+executes. It shows that sub-task's own live steps — reading/indexing → investigating →
+diagnosis → edits → tests → critic — filtered to that sub-task, so the user can see what's
+happening inside the piece they're looking at, not only in a separate shared feed. The
+shared ticket-level Live Activity feed stays; this adds the per-sub-task view on the card.
+
 ---
 
 ## G. Code quality (keep it reviewable)

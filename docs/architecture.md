@@ -118,8 +118,13 @@ Jira ticket (status "To Do")
 [RESOLVE REPOS]  (deterministic cascade + confirm gate — §5c)
    │
    ▼
+[LIGHT REPO OVERVIEW]  (cheap deterministic: file inventory + folder/module structure,
+            reuses cold-index inventory; NO embeddings/graph/investigation — R-54.
+            Shown as a visible "Understanding the repository…" phase.)
+   │
+   ▼
 PLANNER ──► splits into isolated sub-tasks + dependency graph
-            (assigns each sub-task its repo from the confirmed list)
+            (uses the overview to split sensibly; assigns each sub-task its repo)
    │
    ▼
 ORCHESTRATOR ──► picks next ready sub-task (parallel where independent)

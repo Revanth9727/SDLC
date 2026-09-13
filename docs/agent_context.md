@@ -69,6 +69,7 @@ gate (R-48), never directly. GitHub token saved encrypted per repo (R-42) — no
 
 ```
 Jira (poll every N min, claim only category=new / "To Do") → [RESOLVE REPOS: cascade + confirm gate]
+  → [LIGHT REPO OVERVIEW: cheap inventory/structure, visible "Understanding the repo…" (R-54)]
   → PLANNER → sub-tasks → ORCHESTRATOR picks one
   → per sub-task (ISOLATED state, scoped to ONE repo):
        DIAGNOSIS → STEP-PLANNER → HUMAN GATE (pause) → EXECUTOR → CRITIC → [PR] → [memory write-back]
