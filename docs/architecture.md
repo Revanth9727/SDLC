@@ -180,7 +180,10 @@ call**, i.e. deterministic code. Every stage is **checkpointed**.
 
 > **Where the PR is opened (important):** a sub-task does NOT open its own PR. On
 > Critic-approval a sub-task is marked ready-for-integration; the integration stage
-> assembles all sub-tasks, runs the full suite, and only then publishes. **Publishing is a
+> assembles all sub-tasks, runs the full suite, and only then publishes. **The PR contains
+> exactly the tested integrated artifact (R-31b):** publish opens the PR from the integration
+> stage's combined result (all sub-tasks together, one PR per affected repo) — never from a
+> single sub-task or subset. Approved = tested = published. **Publishing is a
 > single shared step (R-53):** both the normal ticket flow and the human comment-command
 > flow go through ONE publish path — not the old split where a "legacy"/comment path used
 > separate `publish_pr`/`notify_pr` nodes. That shared step enforces **one open PR per
@@ -545,6 +548,15 @@ output is trusted until the guard passes it.
 > It does NOT run after pure human-decision nodes (human_gate, intent_gate, escalate,
 > human_resolution, apply_resolution), which carry no agent output to validate.
 
+> **Reasoning failures vs infrastructure failures (R-8b).** Retrying an LLM agent only helps
+> a *reasoning* failure (invalid output, failed assertion on a valid test, edit no-match). A
+> *deterministic* failure — an exception raised inside the tooling/validator/guard/IO layer,
+> not from model output — cannot be fixed by asking the model again, so it must NOT consume
+> LLM retries: it stops and escalates (needs_human) with structured failure context
+> (component, function, file:line, exception type, message, sanitized call site, identifiers),
+> never just the bare exception message. This keeps distinct bugs distinguishable and stops
+> wasted retry budget on tooling crashes.
+
 ---
 
 ## 7. Isolation & memory (how reuse coexists with isolation)
@@ -581,16 +593,41 @@ prompt per micro-action.
 Sub-task isolation prevents hallucination, but it also means sub-task A (frontend) has
 no idea it may have broken sub-task B (backend). So after all sub-tasks in a ticket are
 individually complete — but **before any PR** — an **integration stage** (owned by the
-Orchestrator) assembles the *combined* change across affected repos, runs the **full**
-test suite, and checks for cross-breakage. The team guarantee: the whole change is
-validated as one, not just each piece in isolation.
-- All integrated checks pass → proceed to PR(s).
-- Cross-breakage detected → escalate to the human with what broke, rather than shipping
-  a change that passes per-sub-task but fails as a whole.
+Orchestrator) assembles the *combined* change across affected repos, **deterministically
+merges** overlapping edits, runs the **full** test suite on the combination, and only then
+publishes (R-31b). The team guarantee: the whole change is validated as one, not just each
+piece in isolation.
+
+**The escalation threshold is decidability, not overlap (R-31).** "Same file" or even "same
+function" touched is NOT automatically a conflict. The real question is: *can the system
+produce and verify ONE unambiguous combined implementation?* Yes → continue automatically;
+no → human. The merge is **deterministic** (3-way / line-level, git-style) — an LLM never
+decides whether two edits conflict.
+
+Four outcomes, escalating only at the last:
+- **Normal overlap** (e.g. two sub-tasks add different test functions to the same file) →
+  merge automatically, run combined tests.
+- **Compatible overlap** (same function, but 3-way merge is clean and combined tests pass) →
+  proceed. A clean text merge is necessary but not sufficient — the full combined suite must
+  pass (two sub-tasks each adding a `shared_fixture` merge textually but break pytest).
+- **Semantic interaction** (clean merge, but combined behavior is wrong because the changes
+  affect each other → they weren't truly independent) → persist structured interaction
+  evidence and run bounded reconciliation. A changed candidate is always fully re-tested and
+  re-reviewed by Critic before publication; old proof is invalid.
+- **Unresolvable ambiguity** (real line-level conflict, or a combined failure the system can't
+  safely repair) → **human** — a decision surface, not an approve button: the UI explains what
+  conflicts and why, and offers resolve-manually / state-intended-behavior (→ agents rebuild +
+  re-test + Critic re-review) / reject-one / re-plan.
 
 This is the one place the isolated pieces are deliberately viewed together. It only
 exists once a ticket has multiple sub-tasks, so it is built with multi-sub-task support
 (Phase 8).
+
+The final integration artifact is frozen only after both combined verification and the
+final Critic review approve the same file map. Human-provided intent or rejection of one
+change rebuilds that map from the common base, then repeats both checks. Deterministic tool
+failures are R-8b infrastructure failures, while an ordinary textual conflict is a merge
+result; neither is spent as a reasoning retry.
 
 ## 7c. Verifiability (no tests / no CI)
 
@@ -862,7 +899,199 @@ corruption is impossible.
 **Deferred (designed-for, not built early):** AST-based editing for structured config
 files (JSON/YAML/TOML); script-generation for very large (>1000-line) files.
 
+**What happens when a candidate fails → see §8b** (Executor retry pipeline: structured
+retry evidence, generated-test two-layer validation, duplicate-candidate protection, and
+execution constraints).
+
 ---
+
+## 8b. Executor retry pipeline (what happens when a candidate fails)
+
+The Executor retry pipeline defines what evidence the next LLM attempt must receive and what
+deterministic checks protect against invalid or repeated candidates. It does NOT redesign the
+edit applier or relax any matching rule.
+
+### Generated-test validation (two layers)
+
+A generated test must pass BOTH layers before it may be used as evidence that production code
+is wrong.
+
+**Layer 1 — Internal test validity (deterministic).**
+Does the test's own setup/input/assertion contradict itself? Checked deterministically by AST
+analysis. All recognized outcomes for the same result must be internally consistent:
+PASS + FAIL is invalid even when the ticket requirement is unresolved. Repeated PASS or
+repeated FAIL is valid; unrelated assertions are not assigned semantic outcomes.
+If contradictory → reasoning failure → regenerate the TEST (R-32b), before pytest.
+
+**Layer 2 — Requirement alignment (deterministic + Critic residue).**
+Does the behavior asserted by the test agree with the approved ticket requirement and any
+approved human constraints?
+
+Mechanism:
+1. **Normalize assertion semantics (R-32e).** Extract expected outcome as `PASS` or `FAIL`
+   from every assertion on the result object, covering four AST shapes:
+   - direct attribute: `assert result.passed`
+   - `UnaryOp(Not, …)`: `assert not result.passed`
+   - `is True/False`: `assert result.passed is True`
+   - `== True/False`: `assert result.passed == True`
+   Negated forms (`not`, `is False`, `== False`) normalize to `FAIL`.
+
+Scenario association (R-32 Phase 1): Internal consistency is evaluated per deterministic
+scenario/result binding, scoped by function and assignment. Requirement alignment applies
+only to scenarios safely associated through deterministic literal input or setup evidence,
+checking every mapped scenario. Unrelated scenarios may legitimately expect different
+outcomes; file-level MIXED is not automatically invalid. Preserve scenario evidence and
+outcomes. Inability to map a requirement to a scenario resolves to UNKNOWN, never global
+application or contradiction. Internal consistency still runs when alignment is UNKNOWN.
+
+2. **Compare to requirement (R-32f).** Requirement alignment evaluates every deterministically mapped
+   scenario and all its recognized assertion outcomes, never only the first. Preserve the full outcome list;
+   summarize differing outcomes as MIXED, which is valid across unrelated scenarios. If the approved requirement is unambiguous (e.g. "empty
+   entries must be ignored → expected outcome PASS") and the normalized assertion says `FAIL`,
+   reject immediately — before running the test.
+3. **Critic residue.** Subtler, indirect contradictions that the deterministic layer cannot
+   resolve are passed to the Critic's TEST validity check (R-32b), which evaluates the test
+   against the ticket text.
+
+**Critical invariant:** a generated test that contradicts the approved requirement MUST NOT
+cause production code to be modified. Production code is untouched; the test is regenerated
+with the specific contradiction named in the feedback.
+
+```
+APPROVED TICKET / HUMAN CONSTRAINTS
+        ↓
+PLANNED STEP
+        ↓
+CURRENT SOURCE (fresh — R-20)
+        ↓
+EXECUTOR CANDIDATE
+        ↓
+        ├── CODE EDIT
+        │      ↓
+        │   deterministic application
+        │   (exact → whitespace-normalised → fuzzy ≥ 0.8 — §8)
+        │   NoMatch → fail; Ambiguous → fail closed (R-15)
+        │
+        └── GENERATED TEST
+               ↓
+           assertion-semantic extraction (R-32e)
+               ↓
+           Layer 1: internal validity (R-32b)
+               ↓
+           Layer 2: requirement alignment (R-32f)
+               ↓
+           run test
+        ↓
+PASS → continue
+
+On reasoning failure:
+RetryAttempt record
+  (failed candidate + exact failure + deterministic evidence
+   + requirement / constraints + all prior attempts in cycle)
+        ↓
+duplicate fingerprint check (R-58d)
+        ↓
+next bounded model attempt (R-8)
+
+Infrastructure failure:
+    FailureContext → no LLM retry → controlled escalation (R-8b)
+```
+
+### RetryAttempt vs. FailureContext
+
+| | FailureContext | RetryAttempt |
+|---|---|---|
+| **Purpose** | Operational/observability record | Reasoning evidence for the next LLM attempt |
+| **Consumer** | Debugging, audit, escalation notices | The next model prompt |
+| **Persisted** | Yes, always | Yes, alongside FailureContext |
+| **Contains** | Component, function, file:line, exception type, sanitized stack | Failed candidate, failure type, deterministic evidence, requirement evidence, corrective instruction |
+| **Accumulated** | Yes (attempt_history) | Yes — attempt N receives 1…N-1 (R-58b) |
+
+### Retry evidence requirements (R-58)
+
+**State field shape.**
+```python
+# on SubtaskState
+retry_attempts: dict[str, list[RetryAttempt]]  # key = step_id
+```
+Each step owns an independent retry list. A new `step_id` always starts empty. Historical
+entries for superseded steps remain in the dict but are not injected into active retry prompts.
+The list length per step is bounded by `max_agent_retries + 1`.
+
+Each `RetryAttempt` record preserves:
+- **candidate fingerprint** — `sha256` of the **full normalized candidate content before any
+  truncation**. Authoritative key for duplicate detection.
+- **candidate content** — bounded head+tail preview capped at **8,000 characters**. If the
+  original exceeds this, a head slice + tail slice are stored.
+- **`candidate_content_truncated`** — `True` when the 8,000-char cap was applied. The
+  fingerprint is always from the full content; this flag tells the model that only a preview
+  is shown.
+- **failure type and reason** — `NoMatch`, `Ambiguous`, `GuardFailure`, etc.
+- **deterministic failure evidence:**
+  - NoMatch → closest-match lines + similarity score from the applier
+  - Ambiguous → match count + line ranges for each match location
+  - Others → the validator's exact message
+- **corrective instruction** — derived deterministically from failure type, not invented
+- **accumulated prior attempts** — the full list `retry_attempts[step_id]` from this cycle
+
+**History accumulates per step.** Attempt N reads the full `retry_attempts[step_id]` list —
+not only the latest entry. A mutable "latest error string" that overwrites prior failures is
+insufficient — earlier entries (exact failed SEARCH blocks, closest-match text) must remain
+visible to later attempts.
+
+### Duplicate-candidate protection (R-58d, R-58e)
+
+Before passing any new candidate to the execution layer, compute its deterministic content
+hash. If the hash matches any prior attempt in the same retry cycle:
+- reject without executing
+- count it against the retry budget (no exemptions — that would allow unbounded retries)
+- add the duplication as feedback ("model is producing the same candidate again") to the next
+  attempt's evidence
+
+Applies to both edit candidates and generated test bodies. Exact-hash matching only — no
+semantic duplicate detection in this phase.
+
+### Execution constraints (R-59)
+
+The Executor payload carries an explicit `execution_constraints` list field — separate from
+`repair_feedback` — containing authoritative constraints from: the approved ticket requirement
+(always), human-approved clarifications from the approval gate, and Critic corrections
+accepted into the plan.
+
+**Deterministic scope taxonomy.** Each constraint carries a `scope_type` and `scope_value`.
+A constraint is included in the current step's payload if and only if its scope matches:
+
+| `scope_type` | Included when |
+|---|---|
+| `ticket` | Always — applies to every step in this ticket |
+| `subtask` | `scope_value == current subtask_id` |
+| `step` | `scope_value == current step_id` |
+| `file` | `scope_value == current step.target_file` (exact path) |
+| `symbol` | `scope_value` is a symbol the current step targets or interacts with |
+
+No keyword matching, no LLM relevance inference — inclusion is a deterministic equality or
+membership check only. Broad behavioral clarifications (e.g. "empty strings must be ignored
+throughout") are stored at `ticket` or `subtask` scope so they reach every relevant step
+without any heuristic.
+
+A candidate that violates an included constraint is a reasoning failure → regenerate with
+the constraint named in the feedback. This is never a raw Jira-thread dump.
+
+---
+
+
+Overlapping authoritative constraints with deterministically incompatible normalized behavior
+must block execution until human intent is resolved. No LLM may choose authoritative intent
+precedence. There is no latest-wins, human-over-ticket, or narrower-scope precedence.
+Compare only explicit scope overlap in the isolated ticket/subtask and approved plan, and
+only supported normalized subjects and PASS/FAIL behavior. Arbitrary text is UNKNOWN.
+Identical records are deduplicated; advisory Critic/retry evidence is not authoritative.
+Persist both constraint identities, original text, source/provenance, scope, incompatible
+behavior, overlap evidence, and affected plan targets. This is a needs_human decision,
+not an infrastructure failure or an Executor reasoning retry. The existing human-resolution
+flow must support explicit withdrawal/replacement, clarification and re-planning, preserve
+an audit of the decision, and recheck conflicts before execution can resume. Withdrawn
+constraints must not be recreated from legacy requirement capture on restart.
 
 ## 8a. Workspaces (ephemeral scratch — the laptop holds nothing durable)
 
@@ -941,6 +1170,17 @@ core loop:
 
 The build order in `codex_prompts.md` follows this: **spine first, breadth and polish
 later, each phase producing something you can see and test.**
+
+### Production hardening (staged, separate track)
+
+Turning the working system (Phases 1–12) into a production-grade one is tracked separately
+in **HARDENING_ROADMAP.md**, in six dependency-ordered stages: **Correctness → Security →
+Recovery → AI Quality → Telemetry → Deployment.** Rule while hardening: the feature roadmap
+is FROZEN until Stage 1 (correctness) is genuinely done and a clean end-to-end proof run
+exists. Only Stage-1 items are decided and specified as rules today (notably R-31b
+tested=published, R-32b test-validity + repair path). Stages 2–6 are *directions*, not yet
+build-ready: each gets its own design pass — and becomes a teaching-quality rule — only when
+it is picked up to build. Do NOT build a Stage 2–6 item from the roadmap summary alone.
 
 ---
 

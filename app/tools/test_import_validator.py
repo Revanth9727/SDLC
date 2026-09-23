@@ -5,6 +5,7 @@ import ast
 import builtins
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+from typing import Callable, Any
 
 
 class TestImportValidationError(ValueError):
@@ -18,6 +19,53 @@ class SourceModule:
     path: str
     modules: frozenset[str]
     symbols: frozenset[str]
+
+
+SymbolResolver = Callable[[str], list[dict[str, Any]]]
+
+
+def repair_missing_test_imports(
+    checkout: Path,
+    test_path: str,
+    source_paths: list[str],
+    resolve_symbol: SymbolResolver,
+) -> tuple[str, list[str]]:
+    """Insert imports for uniquely resolved, AST-verified missing symbols.
+
+    The normal validator remains authoritative. This helper repairs only a bare
+    symbol that resolves to exactly one real repository module, then validates
+    the resulting file using that module as code-under-test evidence.
+    """
+    target = (checkout / test_path).resolve()
+    content = target.read_text(encoding="utf-8")
+    tree = ast.parse(content, filename=test_path)
+    sources = [source for path in source_paths if (source := _source_module(checkout, path))]
+    imported = _locally_bound_names(tree)
+    loaded = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)}
+    candidates = sorted(loaded - imported - set(dir(builtins)))
+    repairs: list[tuple[str, SourceModule]] = []
+    for symbol in candidates:
+        definitions = resolve_symbol(symbol)
+        resolved: dict[str, SourceModule] = {}
+        for definition in definitions:
+            path = str(definition.get("path", "")).removeprefix("./")
+            if path == test_path:
+                continue
+            source = _source_module(checkout, path)
+            if source and symbol in source.symbols:
+                resolved[source.path] = source
+        if len(resolved) == 1:
+            repairs.append((symbol, next(iter(resolved.values()))))
+
+    if repairs:
+        imports = [f"from {sorted(source.modules, key=lambda value: (value.count('.'), len(value), value))[0]} import {symbol}"
+                   for symbol, source in repairs]
+        content = _insert_imports(content, tree, imports)
+        target.write_text(content, encoding="utf-8")
+        sources.extend(source for _, source in repairs if source not in sources)
+
+    validate_test_imports(checkout, test_path, list(dict.fromkeys(source.path for source in sources)))
+    return content, [symbol for symbol, _ in repairs]
 
 
 def validate_test_imports(checkout: Path, test_path: str, source_paths: list[str]) -> None:
@@ -170,3 +218,18 @@ def _attribute_chain(node: ast.Attribute) -> tuple[str | None, list[str]]:
         attributes.append(value.attr)
         value = value.value
     return (value.id if isinstance(value, ast.Name) else None, list(reversed(attributes)))
+
+
+def _insert_imports(content: str, tree: ast.Module, imports: list[str]) -> str:
+    lines = content.splitlines(keepends=True)
+    insert_after = 0
+    body = tree.body
+    if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) \
+            and isinstance(body[0].value.value, str):
+        insert_after = body[0].end_lineno or body[0].lineno
+    for node in body:
+        if isinstance(node, ast.ImportFrom) and node.module == "__future__":
+            insert_after = max(insert_after, node.end_lineno or node.lineno)
+    block = "".join(f"{statement}\n" for statement in imports)
+    lines.insert(insert_after, block)
+    return "".join(lines)

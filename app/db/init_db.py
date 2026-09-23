@@ -17,6 +17,8 @@ logger = logging.getLogger(__name__)
 def create_all() -> None:
     """Create every table in Base.metadata if it does not already exist."""
     logger.info("Running create_all() against %s", engine.url)
+    with engine.begin() as connection:
+        connection.exec_driver_sql("CREATE EXTENSION IF NOT EXISTS vector")
     Base.metadata.create_all(bind=engine)
     ensure_memory_schema()
     ensure_llm_cache_schema()

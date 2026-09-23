@@ -10,6 +10,7 @@ from sqlalchemy import select
 
 from app.agents.planning import ApprovalDecision
 from app.agents.state import SubtaskState
+from app.agents.constraints import ExecutionConstraint
 from app.config import settings
 from app.core.subtasks import prepare_subtask, ACTIVE_SUBTASK_STATUSES
 from app.core.approvals import _expire_older_pending
@@ -38,7 +39,8 @@ def get_proposal(approval_id):
             raise LookupError('Approval not found')
         return {'id': str(row.id), 'ticket_id': str(row.ticket_id), 'key': row.jira_issue_key,
                 'subtask_id': str(row.subtask_id) if row.subtask_id else None,
-                'status': row.status, 'action': row.proposed_action, 'note': row.decision_note}
+                'status': row.status, 'action': row.proposed_action, 'note': row.decision_note,
+                'source_comment_id': row.source_comment_id}
 
 
 def _finish(approval_id, decision):
@@ -77,8 +79,41 @@ def _new_state(record):
         ticket.status = 'processing'
         db.commit()
     replacement = prepare_subtask(record['ticket_id'], description=description, reuse_fresh_pending=True)
-    return SubtaskState(ticket_id=record['ticket_id'], subtask_id=replacement.subtask_id,
-                        jira_key=key, subtask_type='bug', description=description, repo=repo).model_dump(mode='json')
+    state = SubtaskState(ticket_id=record['ticket_id'], subtask_id=replacement.subtask_id,
+                        jira_key=key, subtask_type='bug', description=description, repo=repo,
+                        prior_attempt=replacement.prior_attempt)
+    # A replacement work identity may inherit ticket intent, but not the old
+    # step IDs or sibling implementation details. The next plan is gated again.
+    for raw in (replacement.prior_attempt or {}).get('execution_constraints', []):
+        item = ExecutionConstraint.model_validate(raw)
+        if item.constraint_id in (replacement.prior_attempt or {}).get("withdrawn_constraint_ids", []):
+            continue
+        if item.scope_type == 'ticket' and item.scope_value == state.ticket_id:
+            state.execution_constraints.append(item)
+        elif ((replacement.prior_attempt or {}).get('repo') == state.repo
+              and (replacement.prior_attempt or {}).get('orchestration_role') != 'coordinator'):
+            if (item.scope_type == 'subtask' and item.scope_value ==
+                    replacement.prior_attempt.get('source_subtask_id')):
+                state.pending_execution_constraints.append(item.model_copy(update={'scope_value': state.subtask_id}))
+            elif item.scope_type in {'file', 'symbol'}:
+                state.pending_execution_constraints.append(item)
+            # Old step IDs do not identify steps in a new work identity. Their
+            # records remain in prior_attempt for review, not active execution.
+    decision = ApprovalDecision.model_validate(record.get('decision') or {
+        'approval_status': 'approved', 'note': record.get('note') or '',
+    })
+    provenance = f"proposal:{record['id']}:jira-comment:{record.get('source_comment_id') or 'unknown'}"
+    state.execution_constraints.append(ExecutionConstraint(
+        source='human_approval_note', text=record['action']['description'],
+        scope_type='subtask', scope_value=state.subtask_id, provenance=provenance,
+    ))
+    if decision.note:
+        state.execution_constraints.append(ExecutionConstraint(
+            source='human_approval_note', text=decision.note,
+            scope_type='subtask', scope_value=state.subtask_id,
+            provenance=decision.provenance or provenance,
+        ))
+    return state.model_dump(mode='json')
 
 
 def proposal_graph(saver):

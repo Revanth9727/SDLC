@@ -19,7 +19,7 @@ from app.tools.github_tool import GitHubTool
 from app.tools.repo_tool import RepoTool
 from app.agents.diagnosis import Diagnosis, DiagnosisAgent
 from app.agents.planner import PlannerAgent
-from app.agents.planning import ApprovalDecision, Plan, Step
+from app.agents.planning import ApprovalDecision, Plan, Step, is_test_path
 from app.agents.state import SubtaskState
 from app.agents.step_planner import StepPlannerAgent
 from app.config import settings
@@ -110,6 +110,8 @@ def build_graph(agent=None, *, planner=None, decomposer=None, investigator=None,
         state.guard_node, state.guard_error = name, None
         try:
             state = await asyncio.to_thread(_guard, state)
+            from app.core.constraint_conflicts import check_constraint_conflicts
+            check_constraint_conflicts(state)
             if state.status == 'running':
                 from app.core.guard import validate_output
                 updated = await asyncio.to_thread((supplied or factory()).run, state.model_copy(deep=True))
@@ -241,6 +243,9 @@ def build_graph(agent=None, *, planner=None, decomposer=None, investigator=None,
 
     async def apply_intent_decision(raw):
         state = SubtaskState.model_validate(raw)
+        from app.core.constraint_conflicts import check_constraint_conflicts
+        if check_constraint_conflicts(state):
+            return state.model_dump(mode='json')
         approved = state.approval_status == "approved"
         tool = jira or JiraTool()
         if approved:
@@ -347,10 +352,17 @@ def build_graph(agent=None, *, planner=None, decomposer=None, investigator=None,
             "plan": state.model_dump(mode="json")["plan"],
             "reasoning": state.plan_reasoning,
             "revision": state.replan_count,
+            "execution_constraints": [item.model_dump(mode="json") for item in
+                                      state.execution_constraints + state.pending_execution_constraints
+                                      if item.constraint_id not in state.withdrawn_constraint_ids],
         }
         message = "Needs approval — proposed plan:\n" + "\n".join(
             f"{step.step_id}. {step.intent} ({step.target_file})" for step in state.plan
         ) + f"\nReasoning: {state.plan_reasoning}"
+        if state.pending_execution_constraints:
+            message += "\nClarifications to approve:\n" + "\n".join(
+                f"- {item.text}" for item in state.pending_execution_constraints
+            )
         tool = jira or JiraTool()
         await _jira_status(state, "awaiting_approval", tool)
         from app.core.approvals import register_plan_gate
@@ -365,10 +377,15 @@ def build_graph(agent=None, *, planner=None, decomposer=None, investigator=None,
         decision = ApprovalDecision.model_validate(interrupt(state.approval_payload))
         state.approval_status = decision.approval_status
         state.approval_note = decision.note
+        from app.core.execution_constraints import record_decision
+        record_decision(state, decision)
         return state.model_dump(mode="json")
 
     async def apply_decision(raw):
         state = SubtaskState.model_validate(raw)
+        from app.core.constraint_conflicts import check_constraint_conflicts
+        if check_constraint_conflicts(state):
+            return state.model_dump(mode='json')
         approved = state.approval_status == "approved"
         tool = jira or JiraTool()
         await _jira_status(state, "in_progress" if approved else "awaiting_approval", tool)
@@ -416,6 +433,7 @@ def build_graph(agent=None, *, planner=None, decomposer=None, investigator=None,
                 selected_executor = ExecutorAgent(
                     repo_tool=workflow_repo_tool,
                     code_search=CodeSearchTool(repo_tool=workflow_repo_tool, event_sink=stream_execution_tool),
+                    checkpoint_retries=True,
                 )
             updated = await selected_executor.run(state.model_copy(deep=True))
             updated = validate_output(state, updated, 'execute')
@@ -423,7 +441,8 @@ def build_graph(agent=None, *, planner=None, decomposer=None, investigator=None,
             updated = state
             updated.guard_node = 'execute'
             updated.guard_error = describe_failure('Executing approved plan', exc)
-        if updated.status == 'running' and updated.steps_done:
+        if (updated.status == 'running' and updated.steps_done
+                and updated.current_step == state.current_step + 1):
             outcome = updated.steps_done[-1]['tests']['outcome']
             note = {'passed': 'pytest passed', 'no_tests_collected': 'no tests to verify yet'}.get(outcome, outcome)
             await _jira_comment(updated, f"Applied step {updated.current_step}; {note}", jira or JiraTool())
@@ -497,20 +516,40 @@ def build_graph(agent=None, *, planner=None, decomposer=None, investigator=None,
             await _jira_comment(updated, f"Critic: {verdict.summary}", tool)
         else:
             updated.critic_retry_count += 1
+            all_issues = list(dict.fromkeys(verdict.test_issues + verdict.issues))
+            feedback = f"Critic rejection {updated.critic_retry_count}: {'; '.join(all_issues)}"
+            updated.attempt_history.append(feedback)
             if updated.critic_retry_count > settings.max_agent_retries:
                 updated.status = 'needs_human'
-                updated.failure_reason = f"Critic rejected the change: {'; '.join(verdict.issues)}"
+                updated.failure_reason = (
+                    'Critic rejected the change after the retry limit. Attempts: '
+                    + '; '.join(updated.attempt_history)
+                )
             else:
-                # Full redo, informed by the issues (architecture.md §4): reset
-                # execution to the approved plan's start, not a partial patch —
-                # the Executor rebuilds the checkout from base_commit each time
-                # anyway (R-20 freshness), so a clean redo is cheap and correct.
-                updated.critic_feedback = verdict.issues
-                updated.current_step = 0
-                updated.steps_done = []
-                updated.file_changes = {}
+                updated.critic_feedback.extend(
+                    issue for issue in all_issues if issue not in updated.critic_feedback
+                )
+                if verdict.test_validity == 'invalid':
+                    test_indexes = [index for index, item in enumerate(updated.plan)
+                                    if is_test_path(item.target_file)]
+                    if not test_indexes:
+                        updated.status = 'needs_human'
+                        updated.failure_reason = 'Critic found an invalid test but the plan has no test step to regenerate'
+                    else:
+                        updated.current_step = test_indexes[0]
+                        test_paths = {item.target_file for item in updated.plan if is_test_path(item.target_file)}
+                        updated.steps_done = [item for item in updated.steps_done
+                                              if item['target_file'] not in test_paths]
+                        for path in test_paths:
+                            updated.file_changes.pop(path, None)
+                            updated.test_validity_checks.pop(path, None)
+                            updated.pending_valid_tests.pop(path, None)
+                else:
+                    updated.current_step = 0
+                    updated.steps_done = []
+                    updated.file_changes = {}
                 updated.execution_complete = False
-            await _jira_comment(updated, f"Critic requested changes: {'; '.join(verdict.issues)}", tool)
+            await _jira_comment(updated, f"Critic requested changes: {'; '.join(all_issues)}", tool)
         return updated.model_dump(mode='json')
 
     async def publish(raw):
@@ -571,12 +610,34 @@ def build_graph(agent=None, *, planner=None, decomposer=None, investigator=None,
 
     def human_resolution(raw):
         state = SubtaskState.model_validate(raw)
+        has_conflicts = any(item.status == 'active' for item in state.constraint_conflicts)
+        actions = ['resolve_constraints', 'reject'] if has_conflicts else (['stay_scope', 'expand_scope', 'reject']
+                   if state.discovered_defect and not state.discovered_defect.get('resolution')
+                   else ['retry', 'reject'])
         decision = interrupt({'kind': 'needs_human', 'reason': state.failure_reason,
-                              'budget': state.budget_used.model_dump(), 'actions': ['retry', 'reject']})
-        if decision.get('action') not in {'retry', 'reject'}:
+                              'budget': state.budget_used.model_dump(), 'actions': actions,
+                              'discovered_defect': state.discovered_defect,
+                              'constraint_conflicts': [item.model_dump(mode='json') for item in state.constraint_conflicts]})
+        if decision.get('action') not in set(actions):
             raise ValueError('Unknown human resolution')
+        if decision['action'] == 'resolve_constraints':
+            from app.agents.constraints import ConstraintChange
+            from app.core.constraint_conflicts import resolve_constraint_conflicts
+            resolve_constraint_conflicts(
+                state, [ConstraintChange.model_validate(item) for item in decision.get('constraint_changes', [])],
+                decision.get('note', ''), f'resolution:{state.subtask_id}:{state.escalation_id}',
+            )
+            state.constraint_resolution_replan = bool(decision.get('replan', False))
         state.resolution = decision['action']
         state.approval_note = decision.get('note', '')
+        if state.resolution in {'retry', 'stay_scope'} and state.approval_note:
+            from app.agents.constraints import ExecutionConstraint
+            from app.core.execution_constraints import append_constraints
+            append_constraints(state.execution_constraints, [ExecutionConstraint(
+                source='human_approval_note', text=state.approval_note,
+                scope_type='subtask', scope_value=state.subtask_id,
+                provenance=f"resolution:{state.subtask_id}:{state.escalation_id}:{state.resolution}",
+            )])
         return state.model_dump(mode='json')
 
     async def apply_resolution(raw):
@@ -584,6 +645,63 @@ def build_graph(agent=None, *, planner=None, decomposer=None, investigator=None,
         if state.resolution == 'reject':
             state.status = 'failed'
             state.failure_reason = 'Closed by human: ' + state.approval_note
+        elif state.resolution == 'resolve_constraints':
+            from app.core.constraint_conflicts import check_constraint_conflicts
+            if check_constraint_conflicts(state):
+                return state.model_dump(mode='json')
+            state.status, state.failure_reason = 'running', None
+            state.approval_status = 'pending'
+            state.guard_error, state.guard_retry = None, False
+            state.guard_node = ('planner' if state.orchestration_role == 'coordinator' else
+                                'step_planner' if state.diagnosis else 'code_intelligence') if state.constraint_resolution_replan else (
+                'prepare_intent_confirmation' if state.orchestration_role == 'coordinator' or not state.plan
+                else 'prepare_approval'
+            )
+            state.current_step, state.steps_done, state.file_changes = 0, [], {}
+            state.execution_complete = False
+            state.pending_valid_tests = {}
+            state.test_validity_checks = {}
+        elif state.resolution == 'stay_scope':
+            defect = state.discovered_defect or {}
+            test_path = defect.get('test_path')
+            test_index = defect.get('test_step_index')
+            if not isinstance(test_path, str) or not isinstance(test_index, int):
+                state.status = 'needs_human'
+                state.failure_reason = 'Cannot resume in scope: discovered-defect checkpoint is incomplete'
+            else:
+                state.status, state.failure_reason = 'running', None
+                state.scope_resolution = 'stay_scope'
+                state.current_step = test_index
+                state.execution_complete = False
+                state.file_changes.pop(test_path, None)
+                state.pending_valid_tests.pop(test_path, None)
+                state.test_validity_checks.pop(test_path, None)
+                state.steps_done = [item for item in state.steps_done if item.get('target_file') != test_path]
+                state.attempt_history.append(
+                    'Human chose stay in scope: regenerate the test to isolate the original requirement. '
+                    'The refined test must still fail against the original unfixed code.'
+                )
+                state.guard_node = 'execute'
+        elif state.resolution == 'expand_scope':
+            defect = state.discovered_defect or {}
+            feedback = (
+                'Human approved replanning to include the discovered defect: '
+                + str(defect.get('suspected_root_cause') or defect.get('failing_behavior') or state.approval_note)
+            )
+            state.status, state.failure_reason = 'running', None
+            state.scope_resolution = 'expand_scope'
+            state.approval_status = 'rejected'
+            state.approval_note = feedback
+            state.last_rejection_note = feedback
+            from app.core.execution_constraints import record_decision
+            record_decision(state, ApprovalDecision(
+                approval_status='rejected', note=feedback,
+                provenance=f"resolution:{state.subtask_id}:{state.escalation_id}:expand_scope",
+            ))
+            state.attempt_history.append(feedback)
+            state.current_step, state.steps_done, state.file_changes = 0, [], {}
+            state.execution_complete = False
+            state.guard_node = 'step_planner'
         else:
             from app.core.budget import extend
             await asyncio.to_thread(extend, state.ticket_id)

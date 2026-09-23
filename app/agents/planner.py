@@ -13,6 +13,8 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from app.agents.llm import LLMClient
 from app.agents.router import model_tier
 from app.agents.state import BudgetUsed, SubtaskState, SubtaskType
+from app.agents.constraints import ExecutionConstraint
+from app.core.execution_constraints import append_constraints, scoped_constraints, constraint_description
 
 
 class SubtaskSpec(BaseModel):
@@ -53,15 +55,27 @@ class PlannerAgent:
         self.llm = llm or LLMClient()
 
     def run(self, state: SubtaskState) -> SubtaskState:
+        if not state.ticket_requirement:
+            state.ticket_requirement = state.description
+        for raw in (state.prior_attempt or {}).get("execution_constraints", []):
+            item = ExecutionConstraint.model_validate(raw)
+            if item.constraint_id in (state.prior_attempt or {}).get("withdrawn_constraint_ids", []):
+                continue
+            if item.scope_type == "ticket" and item.scope_value == state.ticket_id:
+                append_constraints(state.execution_constraints, [item])
         if not state.confirmed_repos:
             return self._cannot_decompose(state, "No confirmed repo(s) for this ticket")
         try:
             result = self.llm.complete_json(
                 _SYSTEM_PROMPT,
                 json.dumps({
-                    "ticket_description": state.description,
+                    "ticket_description": constraint_description(state),
+                    "execution_constraints": scoped_constraints(state),
+                    "constraint_resolutions": [item.model_dump(mode="json") for item in state.constraint_resolutions],
                     "confirmed_repos": state.confirmed_repos,
                     "repository_overview": state.repo_overview,
+                    "prior_attempt_failures": state.attempt_history,
+                    "previous_attempt_advisory": state.prior_attempt,
                 }),
                 DecompositionResult,
                 tier=model_tier("planner", ambiguous=len(state.confirmed_repos) > 1),
@@ -107,8 +121,15 @@ class PlannerAgent:
         return state
 
 
-_SYSTEM_PROMPT = """You are the Planner. You see the WHOLE ticket — the only agent
+_SYSTEM_PROMPT = """
+Only ticket_requirement and human_approval_note execution_constraints are authoritative.
+critic_correction and prior_attempt records are advisory until explicit human approval.
+constraint_resolutions records the human's explicit withdrawals/replacements. Do not restore
+withdrawn intent from historical descriptions. Never decide authoritative intent precedence.
+You are the Planner. You see the WHOLE ticket — the only agent
 that does (sub-tasks are isolated from each other after this point).
+The authoritative execution_constraints records carry approved intent with explicit scope; preserve it
+when decomposing the ticket. Prior failure text alone never authorizes new intent.
 
 Split ticket_description into an ordered list of isolated sub-tasks, each with a
 unique string spec_id, a type (bug|feature|ci|design), a self-contained
@@ -129,6 +150,14 @@ repository_overview contains deterministic file inventory and folder/module
 structure for the confirmed repos. Use this lightweight map to recognize real
 module boundaries while splitting. It is structural context, not proof of code
 behavior; do not invent implementation details from filenames alone.
+
+previous_attempt_advisory may contain same-ticket integration_evidence and an
+integration_issue from a failed decomposition. Treat it as advisory evidence that
+must be re-verified, but use it to identify which previous sub-tasks, files, symbols,
+and combined tests interacted. If integration_interaction=true, do NOT blindly repeat
+the same independent decomposition: explain in reasoning how the new dependency graph,
+scope boundaries, or grouping addresses the recorded interaction. If the evidence does
+not establish one safe split, return CannotDecompose rather than repeating it.
 
 Explain your split briefly in reasoning. If the ticket's intent is too unclear to
 decompose at all, return CannotDecompose with a reason and null subtasks.

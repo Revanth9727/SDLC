@@ -167,7 +167,10 @@ context; memory serves finished resolutions through a controlled query.**
   threshold. An empty result is correct and expected for novel problems — better than
   injecting a weak, misleading match.
 - **M-3. Never store secrets or full file contents.** Store summaries and file *paths*,
-  not code bodies or anything from `.env`. (R-17 applies here too.)
+  not code bodies or anything from `.env`. (R-17 applies here too.) This extends to the
+  repository-intelligence layer (architecture §7e): secrets / credential-bearing content
+  must be excluded BEFORE code is chunked and embedded — hardening item, see
+  HARDENING_ROADMAP.md Stage 2 #8.
 - **M-4. Write-back failure must not fail the sub-task.** If summarisation or the
   insert fails, log it and continue — the PR is already the real outcome. Memory is an
   enhancement, not on the critical path.

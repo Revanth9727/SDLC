@@ -12,5 +12,8 @@ def require_active(state):
         ticket = db.get(Ticket, UUID(state.ticket_id))
         if not task or task.status not in {'pending', 'waiting', 'running'}:
             raise ValueError('This attempt was stopped or superseded; no further edits or PRs are allowed')
-        if ticket.status in {'done', 'superseded', 'needs_human'}:
+        # A running subtask is the authority for an in-place retry. The ticket's
+        # aggregate may temporarily be needs_human because of a sibling or a
+        # previous node; that must not cancel this active checkpoint mid-loop.
+        if not ticket or ticket.status in {'done', 'superseded'}:
             raise ValueError('The ticket is no longer active; restart through a new approval')

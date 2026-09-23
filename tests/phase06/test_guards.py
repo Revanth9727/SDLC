@@ -162,6 +162,32 @@ def test_no_progress_and_cross_ticket_output_are_rejected(state):
         validate_output(state, changed, 'diagnosis')
 
 
+def test_repair_rewind_requires_validated_test_and_respects_retry_cap(state):
+    from app.core.guard import validate_output
+
+    state.current_step = 1
+    forged = state.model_copy(update={
+        'current_step': 0,
+        'repair_rewind_from': 1,
+        'test_failure_repair_count': 1,
+        'attempt_history': ['pytest failed'],
+    })
+    with pytest.raises(ValueError, match='validated failing test'):
+        validate_output(state, forged, 'execute')
+
+    capped_previous = state.model_copy(update={
+        'test_failure_repair_count': settings.max_agent_retries,
+        'attempt_history': ['pytest failed'] * settings.max_agent_retries,
+    })
+    capped = forged.model_copy(update={
+        'pending_valid_tests': {'test_app.py': {'content': 'def test_x(): pass', 'action': 'create'}},
+        'test_failure_repair_count': settings.max_agent_retries + 1,
+        'attempt_history': ['pytest failed'] * (settings.max_agent_retries + 1),
+    })
+    with pytest.raises(ValueError, match='retry cap'):
+        validate_output(capped_previous, capped, 'execute')
+
+
 @pytest.mark.asyncio
 async def test_budget_guard_pauses_before_agent(state, monkeypatch):
     monkeypatch.setattr(settings, 'ticket_call_budget', 1)

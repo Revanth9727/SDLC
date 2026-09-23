@@ -12,10 +12,12 @@ _STRONG_TASKS = {
     "critic",
     "code_intelligence",
     "diagnosis",
+    "integration_critic",
     "orchestrator",
     "planner",
     "planner_ambiguous",
     "pr_strategy",
+    "reconciliation",
 }
 
 _CHEAP_TASKS = {

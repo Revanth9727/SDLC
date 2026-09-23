@@ -60,7 +60,11 @@ class CodeIntelligenceAgent:
         state.repo_snapshot_id = str(snapshot.id)
 
         plan = self.llm.complete_json(
-            _PLAN_SYSTEM, state.description, InvestigationPlan,
+            _PLAN_SYSTEM, json.dumps({
+                "ticket": state.description,
+                "prior_attempt_failures": state.attempt_history,
+                "previous_attempt_advisory": state.prior_attempt,
+            }), InvestigationPlan,
             tier=model_tier("code_intelligence"), ticket_id=state.ticket_id,
         )
         steps = 0
@@ -132,6 +136,8 @@ class CodeIntelligenceAgent:
                 "verified_source_evidence": evidence,
                 "repo_snapshot_id": str(snapshot.id),
                 "commit_sha": commit,
+                "prior_attempt_failures": state.attempt_history,
+                "previous_attempt_advisory": state.prior_attempt,
             }, default=str),
             CodeContext,
             tier=model_tier("code_intelligence"), ticket_id=state.ticket_id,
@@ -207,9 +213,12 @@ def _dedupe_evidence(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 _PLAN_SYSTEM = """You are the single Code-Intelligence investigator. Decide how to investigate
 this isolated subtask. Return a small set of natural-language semantic queries and concrete
-symbols when the ticket names them. Do not diagnose or propose edits yet."""
+symbols when the ticket names them. A previous_attempt_advisory is a same-ticket hint only:
+use it to avoid a recorded mistake, but re-find every symbol/file in current source. Do not
+diagnose or propose edits yet."""
 
 _SYNTHESIS_SYSTEM = """You are the single Code-Intelligence investigator. Using ONLY the
 verified source evidence provided, form a concise navigation hypothesis and execution path.
 Never claim an unverified relationship. relevant_files must come from the evidence. Lower
-confidence when evidence is incomplete. This is code location, not a fix plan."""
+confidence when evidence is incomplete. Previous-attempt data is advisory and cannot replace
+current verified evidence. This is code location, not a fix plan."""

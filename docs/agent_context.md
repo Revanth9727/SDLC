@@ -168,7 +168,7 @@ through the existing blackboard, guard, and budget.
 2. Every handoff is Pydantic-validated (R-2)
 3. LLM reasons; tools act — model never touches files/git/APIs directly (R-5, R-6)
 4. Every loop has max-N and a human exit; never unbounded (R-8)
-5. A deterministic guard runs after every agent (schema → budget → honest-fail → retry) (R-9)
+5. A deterministic guard runs after every agent (schema → budget → honest-fail → retry) (R-9); retries are for reasoning failures, not deterministic tool crashes, which stop + escalate with structured context (R-8b); each retry receives structured evidence from ALL prior attempts in the cycle — not just the latest error — including the failed candidate, deterministic failure evidence, and scoped constraints (R-58, R-59)
 6. Agents can say "I can't" — never fabricate when cornered (R-10)
 7. Persist state after every node; resume after crash/restart (R-12)
 8. Edits are SEARCH/REPLACE, exactly-one-match, guarded, reversible, bottom-up (R-14–R-16)
@@ -188,10 +188,53 @@ in Phase 7.5 (after full flow works, so resolved tickets exist to match).
 - **Intent gate (R-30):** never change anything without a prior human gate (batched per
   plan, not per keystroke). Planner states its reading + asks before decomposing. Phase 7.
 - **Integration stage (R-31):** sub-tasks are isolated, so after all are done and BEFORE
-  any PR, assemble the combined change, run the FULL suite, catch cross-breakage (frontend
-  breaking backend). Break → escalate, no PR. Phase 8.
+  any PR, deterministically merge the approved changes and run the FULL suite. Same-file or
+  same-function overlap is allowed when one unambiguous combined implementation can be
+  produced and verified. Clean-merge behavioral failures enter bounded reconciliation;
+  each new candidate is re-tested and re-Critic-reviewed. Ambiguity → a four-action human
+  decision surface, no PR. Phase 8.
 - **Verifiability (R-32):** no tests in a repo → a fix can't be verified → flag at the gate,
   optionally write a test; Critic surfaces uncovered changes. Never assume safe. Phase 7.
+
+Scenario association (R-32 Phase 1): Internal consistency is evaluated per deterministic
+scenario/result binding, scoped by function and assignment. Requirement alignment applies
+only to scenarios safely associated through deterministic literal input or setup evidence,
+checking every mapped scenario. Unrelated scenarios may legitimately expect different
+outcomes; file-level MIXED is not automatically invalid. Preserve scenario evidence and
+outcomes. Inability to map a requirement to a scenario resolves to UNKNOWN, never global
+application or contradiction. Internal consistency still runs when alignment is UNKNOWN.
+
+- **Generated-test validation (R-32e/R-32f):** assertion semantics are normalized to PASS/FAIL
+  before any comparison (catches negated forms like `assert not result.passed`); a test whose
+  normalized outcome contradicts a deterministically associated requirement is rejected
+  and regenerated —
+  production code is NEVER modified to satisfy a requirement-contradicting test.
+- **Executor retry evidence (R-58/R-59):** retry attempts are stored on `SubtaskState` as
+  `retry_attempts: dict[str, list[RetryAttempt]]` keyed by `step_id` — each step has an
+  independent, isolated retry list (max `max_agent_retries + 1` entries). Each `RetryAttempt`
+  carries: candidate fingerprint (sha256 of full content before truncation), candidate content
+  capped at 8,000 chars (head+tail preview; `candidate_content_truncated` flag set when
+  applied), deterministic failure evidence (closest lines for NoMatch; match count + line
+  ranges for Ambiguous), and corrective instruction. Duplicate candidates are detected by
+  fingerprint, rejected without execution, and counted against the budget. Execution
+  constraints (`execution_constraints` field, separate from `repair_feedback`) are included
+  deterministically by scope type: `ticket`-scoped applies to all steps; `subtask`-scoped to
+  the matching subtask; `step`/`file`/`symbol`-scoped to exact matches only. No keyword or
+  LLM inference. See architecture.md §8b.
+
+
+Overlapping authoritative constraints with deterministically incompatible normalized behavior
+must block execution until human intent is resolved. No LLM may choose authoritative intent
+precedence. There is no latest-wins, human-over-ticket, or narrower-scope precedence.
+Compare only explicit scope overlap in the isolated ticket/subtask and approved plan, and
+only supported normalized subjects and PASS/FAIL behavior. Arbitrary text is UNKNOWN.
+Identical records are deduplicated; advisory Critic/retry evidence is not authoritative.
+Persist both constraint identities, original text, source/provenance, scope, incompatible
+behavior, overlap evidence, and affected plan targets. This is a needs_human decision,
+not an infrastructure failure or an Executor reasoning retry. The existing human-resolution
+flow must support explicit withdrawal/replacement, clarification and re-planning, preserve
+an audit of the decision, and recheck conflicts before execution can resume. Withdrawn
+constraints must not be recreated from legacy requirement capture on restart.
 
 ## Cost & efficiency (R-33/34)
 
@@ -216,14 +259,19 @@ Phase 10 hardening — Python, no Go.
 LLM client, same Postgres — no separate service, no Go gateway. Built in Phase 9 (needs
 agent traffic to cache).
 
-- Build in the phase order from `codex_prompts.md`. **Do not build ahead.**
-- Deferred (do NOT build until its phase): parallel sub-tasks, full memory layer,
+- Build in the phase order from `codex_prompts.md`. **Do not build ahead.**- Deferred (do NOT build until its phase): parallel sub-tasks, full memory layer,
   AST config edits, large-file scripting, multi-user/auth, MCP/A2A. Code understanding
   for large repos (retrieval, symbols, knowledge graph, code slicing) is **Phase 11**
   (code intelligence), not the old "someday" list. Trajectory/context compaction for long
   agent histories remains deferred (distinct from code slicing).
 - **Every phase must end with something visible in the UI AND a passing test.**
   If a prompt's result can't be seen or tested, stop and fix the approach.
+- **Production hardening** is a separate staged track (HARDENING_ROADMAP.md): Correctness →
+  Security → Recovery → AI Quality → Telemetry → Deployment. Feature work is frozen until
+  Stage 1 correctness is done. Key Stage-1 invariant: **approved = tested = published**
+  (R-31b) — the PR contains exactly the integrated artifact that was tested, never one
+  sub-task. A failing test validates the TEST before touching production code (R-32b).
+  Stages 2–6 need their own design pass before building — don't build from the summary.
 
 ## Project layout
 

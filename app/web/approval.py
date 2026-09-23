@@ -139,6 +139,12 @@ async def ticket_subtasks(ticket_id: UUID):
             row["state"] = state.model_dump(mode="json")
             row["status"] = state.status
         row["waiting"] = snapshot.next in {(node,) for node in GATE_NODES} and any(task.interrupts for task in snapshot.tasks)
+    from app.tools.test_preflight import credential_prompt
+    for row in rows:
+        state = row.get("state") or {}
+        credentials = (credential_prompt(row["subtask_id"], state.get("required_test_credentials") or [])
+                       if state.get("verifiability") == "unverifiable" else [])
+        row["verification_prompt"] = {"credentials": credentials} if credentials else None
     return rows
 
 

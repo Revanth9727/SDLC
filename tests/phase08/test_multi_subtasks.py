@@ -37,6 +37,7 @@ def coordinator():
 
 
 def test_materializes_isolated_states_and_uuid_dependencies(coordinator):
+    coordinator.prior_attempt = {"failure_reason": "prior mistake"}
     states = materialize_subtasks(coordinator)
     assert [state.spec_id for state in states] == ["1", "2", "3"]
     assert [state.description for state in states] == ["Fix tax", "Expose total", "Fix discount"]
@@ -44,6 +45,10 @@ def test_materializes_isolated_states_and_uuid_dependencies(coordinator):
     assert states[0].confirmed_repos == ["org/api"]
     assert states[1].confirmed_repos == ["org/web"]
     assert states[1].depends_on == [states[0].subtask_id]
+    assert all(state.prior_attempt == {"failure_reason": "prior mistake"} for state in states)
+    states[0].prior_attempt["failure_reason"] = "locally considered"
+    assert states[1].prior_attempt["failure_reason"] == "prior mistake"
+    assert all(state.diagnosis is None and state.plan == [] and state.current_step == 0 for state in states)
     with SessionLocal() as db:
         assert db.get(Subtask, uuid.UUID(coordinator.subtask_id)).status == "done"
         rows = db.query(Subtask).filter(Subtask.ticket_id == uuid.UUID(coordinator.ticket_id),

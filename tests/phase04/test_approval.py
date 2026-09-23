@@ -80,6 +80,8 @@ def setup(monkeypatch):
         async def run(self, state):
             state.current_step = len(state.plan)
             state.execution_complete = True
+            state.base_commit = "base-sha"
+            state.file_changes = {"app.py": "def divide(a, b):\n    return a / b\n"}
             return state
     class Publisher:
         def publish_changes(self, state):
@@ -89,7 +91,9 @@ def setup(monkeypatch):
             pass
 
         def run(self, state):
-            state.critic_verdict = {'approved': True, 'issues': [], 'verifiability': 'ok'}
+            state.critic_verdict = {'approved': True, 'issues': [], 'verifiability': 'ok',
+                                    'test_validity': 'valid', 'test_issues': [],
+                                    'implementation_valid': True}
             return state
     monkeypatch.setattr(module, 'ExecutorAgent', Executor)
     monkeypatch.setattr(module, 'GitHubTool', Publisher)

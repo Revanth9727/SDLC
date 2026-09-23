@@ -133,8 +133,12 @@ class GitHubTool:
             raise ValueError('Publication requires approved, completed execution')
         # exit 5 (no tests collected) is not a failure (ai_rules.md R-46) — a step
         # is publishable if it truly passed, or was honestly inconclusive.
-        if not state.steps_done or not all(
-                step['tests']['outcome'] in ('passed', 'no_tests_collected') for step in state.steps_done):
+        if not state.integration_verified and (
+            not state.steps_done or not all(
+                step['tests']['outcome'] in ('passed', 'no_tests_collected')
+                for step in state.steps_done
+            )
+        ):
             raise ValueError('Every step must have passing or inconclusive (no-tests) results')
         tool = self.repo_tool or RepoTool(github=self)
         branch = tool.branch_name(state.subtask_id)

@@ -40,6 +40,8 @@ def test_ticket_detail_contains_complete_state_driven_interface():
         "subtaskGate(row)", "Sequential by dependency",
         "eventsBySubtask", "rememberSubtaskEvent(event)",
         "renderSubtaskTimeline(article, row)", "Live steps",
+        "verificationSummary(state)", "verificationCredentials(row)",
+        "Used only for this run, not stored.", "verification-credentials",
     ):
         assert control in source
     assert "active?.waiting" in source

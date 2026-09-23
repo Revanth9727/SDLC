@@ -23,6 +23,7 @@ class SubtaskReplacement:
     subtask_id: str
     superseded: tuple[dict[str, str], ...]
     reused: bool = False
+    prior_attempt: dict[str, Any] | None = None
 
 
 def summarize_subtask(subtask: Subtask, events: list[TicketEvent]) -> str:
@@ -99,6 +100,13 @@ def prepare_subtask(
                 .order_by(Subtask.created_at.desc(), Subtask.id.desc())
             )
         )
+        attempts = list(
+            db.scalars(
+                select(Subtask)
+                .where(Subtask.ticket_id == parsed_ticket_id)
+                .order_by(Subtask.created_at.desc(), Subtask.id.desc())
+            )
+        )
         reused = bool(
             reuse_fresh_pending
             and active
@@ -109,6 +117,11 @@ def prepare_subtask(
             keep = active.pop(0)
         else:
             keep = None
+        prior_attempt = next(
+            (_advisory_context(row) for row in attempts
+             if row.id != getattr(keep, "id", None) and row.state),
+            None,
+        )
 
         for old in active:
             events = list(
@@ -166,6 +179,7 @@ def prepare_subtask(
             subtask_id=str(keep.id),
             superseded=tuple(summaries),
             reused=reused,
+            prior_attempt=prior_attempt,
         )
 
 
@@ -203,3 +217,34 @@ def _step_label(step: Any) -> str:
     if isinstance(step, dict):
         return str(step.get("intent") or step.get("step_id") or "unnamed step")
     return str(step)
+
+
+def _advisory_context(subtask: Subtask) -> dict[str, Any]:
+    """Project one same-ticket attempt into bounded hints, never resumable state."""
+    state = subtask.state or {}
+    diagnosis = state.get("diagnosis") or {}
+    plan = state.get("plan") or []
+    completed = state.get("steps_done") or []
+    return {
+        "label": "from a previous attempt - re-verify against current code",
+        "source_subtask_id": str(subtask.id),
+        "repo": state.get("repo"),
+        "orchestration_role": state.get("orchestration_role", "legacy"),
+        "execution_constraints": list(state.get("execution_constraints") or []),
+        "withdrawn_constraint_ids": list(state.get("withdrawn_constraint_ids") or []),
+        "status": subtask.status,
+        "failure_reason": str(state.get("failure_reason") or "")[:4000] or None,
+        "attempt_history": [str(item)[:1000] for item in list(state.get("attempt_history") or [])[-10:]],
+        "diagnosis": {
+            "root_cause": str(diagnosis.get("root_cause") or "")[:2000],
+            "files": [str(path)[:500] for path in list(diagnosis.get("files") or [])[:25]],
+            "reasoning": str(diagnosis.get("reasoning") or "")[:2000],
+        } if diagnosis else None,
+        "plan": [{key: step.get(key) for key in ("step_id", "intent", "target_file", "action")}
+                 for step in plan[:20] if isinstance(step, dict)],
+        "steps_completed": [{key: step.get(key) for key in ("step_id", "intent", "target_file")}
+                            for step in completed[:20] if isinstance(step, dict)],
+        "integration_evidence": list(state.get("integration_evidence") or [])[-10:],
+        "integration_issue": state.get("integration_issue"),
+        "integration_replan_count": int((state.get("integration_issue") or {}).get("replan_count", 0)),
+    }

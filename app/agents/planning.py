@@ -16,6 +16,7 @@ class Step(BaseModel):
     # the repo, "create" requires it NOT to. Never inferred from file presence
     # alone — the plan states its intent explicitly (ai_rules.md R-46).
     action: Literal["edit", "create", "delete"] = "edit"
+    target_symbols: list[str] = Field(default_factory=list)
 
     @field_validator("target_file")
     @classmethod
@@ -71,3 +72,4 @@ class ApprovalDecision(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
     approval_status: Literal["approved", "rejected"]
     note: str = Field(default="", max_length=4000)
+    provenance: str = Field(default="", max_length=1000)

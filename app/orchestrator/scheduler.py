@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import uuid
 from typing import Awaitable, Callable
@@ -10,6 +11,7 @@ from sqlalchemy import select, text
 
 from app.agents.state import SubtaskState
 from app.core.failures import describe_failure
+from app.core.execution_constraints import inherited_ticket_constraints
 from app.db.connection import SessionLocal
 from app.db.models import Subtask, Ticket
 from app.events import log_event
@@ -61,6 +63,7 @@ def materialize_subtasks(coordinator: SubtaskState) -> list[SubtaskState]:
                 subtask_id=str(ids[str(spec["spec_id"])]),
                 subtask_type=spec["type"],
                 description=spec["description"],
+                execution_constraints=inherited_ticket_constraints(coordinator),
                 repo=spec["repo"],
                 confirmed_repos=[spec["repo"]],
                 depends_on=dependencies,
@@ -68,6 +71,7 @@ def materialize_subtasks(coordinator: SubtaskState) -> list[SubtaskState]:
                 spec_id=str(spec["spec_id"]),
                 orchestration_index=index,
                 parent_subtask_id=coordinator.subtask_id,
+                prior_attempt=copy.deepcopy(coordinator.prior_attempt),
             )
             states.append(state)
             db.add(Subtask(id=ids[str(spec["spec_id"])], ticket_id=ticket_id, type=spec["type"],

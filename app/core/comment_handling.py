@@ -154,6 +154,7 @@ async def handle_comment(key, comment, jira, monitor=None):
         decision = ApprovalDecision(
             approval_status='approved' if intent.intent == 'APPROVE' else 'rejected',
             note=intent.feedback,
+            provenance=f"jira:{key}:comment:{comment_id}:gate:{gate_id}",
         )
         result = await decide_registered(gate_id, decision)
         resumed = decision.approval_status == 'approved' or bool(decision.note)

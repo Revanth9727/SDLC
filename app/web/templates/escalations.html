@@ -4,16 +4,34 @@
 <nav class="app-nav" aria-label="Primary"><a href="/">Tickets</a><a href="/escalations">Needs human</a><a href="/settings/statuses">Jira statuses</a></nav>
 </div></header><main class="page-stack"><div class="page-heading"><div><div class="eyebrow">Review queue</div><h1>Needs human</h1><p>Resolve blocked attempts and budget pauses without losing their saved state.</p></div></div>
 <div class="escalation-list">{% for item in items %}<section class="card escalation-card"><h2><a href="/tickets/{{ item.ticket_id }}">{{ item.description }}</a></h2>
-<p>{{ item.state.failure_reason or 'This attempt needs human help.' }}</p>
+	<p>{{ item.state.failure_reason or 'This attempt needs human help.' }}</p>
+	{% if item.state.failure_contexts %}{% set failure = item.state.failure_contexts[-1] %}<details class="failure-context"><summary>Technical failure details</summary><pre>Classification: {{ failure.classification }}
+Component: {{ failure.component }}
+Operation: {{ failure.operation }}
+Call site: {{ failure.file }}:{{ failure.line }} in {{ failure.function }}
+Exception: {{ failure.exception_type }}: {{ failure.message }}
+Reason: {{ failure.reason }}</pre></details>{% endif %}
 <details><summary>State so far</summary><pre>{{ item.state|tojson(indent=2) }}</pre></details>
-<label>Resolution note <textarea id="note-{{ item.id }}" maxlength="4000"></textarea></label>
-<div class="action-row"><button class="primary-button" onclick="resolveItem('{{ item.ticket_id }}','{{ item.id }}','retry','{{ item.state.escalation_id }}',this)">Retry / Continue budget</button>
-<button class="danger-button" onclick="resolveItem('{{ item.ticket_id }}','{{ item.id }}','reject','{{ item.state.escalation_id }}',this)">Reject and close</button></div>
+{% set has_conflicts = (item.state.constraint_conflicts or [])|selectattr('status', 'equalto', 'active')|list %}
+{% if has_conflicts %}<div class="constraint-resolution-mount" data-ticket="{{ item.ticket_id }}" data-subtask="{{ item.id }}"><script type="application/json">{{ item.state|tojson }}</script></div>{% else %}
+<label>Resolution note <textarea id="note-{{ item.id }}" maxlength="4000"></textarea></label>{% endif %}
+<div class="action-row">{% if has_conflicts %}
+<button class="danger-button" onclick="resolveItem('{{ item.ticket_id }}','{{ item.id }}','reject','{{ item.state.escalation_id }}',this)">Reject and close</button>
+{% elif item.state.discovered_defect and not item.state.discovered_defect.resolution %}
+<button class="primary-button" onclick="resolveItem('{{ item.ticket_id }}','{{ item.id }}','stay_scope','{{ item.state.escalation_id }}',this)">Stay in scope</button>
+<button class="secondary-button" onclick="resolveItem('{{ item.ticket_id }}','{{ item.id }}','expand_scope','{{ item.state.escalation_id }}',this)">Expand scope</button>
+<button class="danger-button" onclick="resolveItem('{{ item.ticket_id }}','{{ item.id }}','reject','{{ item.state.escalation_id }}',this)">Abort</button>
+{% else %}<button class="primary-button" onclick="resolveItem('{{ item.ticket_id }}','{{ item.id }}','retry','{{ item.state.escalation_id }}',this)">Retry / Continue budget</button>
+<button class="danger-button" onclick="resolveItem('{{ item.ticket_id }}','{{ item.id }}','reject','{{ item.state.escalation_id }}',this)">Reject and close</button>{% endif %}</div>
 <p class="inline-status" role="status"></p></section>{% else %}<section class="card"><p class="empty-state">No escalated subtasks.</p></section>{% endfor %}</div>
-</main><script>
+</main><script src="/static/constraint_resolution.js"></script><script>
+document.querySelectorAll('.constraint-resolution-mount').forEach(mount => {
+ const state = JSON.parse(mount.querySelector('script').textContent);
+ mount.appendChild(window.constraintConflictPanel(mount.dataset.ticket, mount.dataset.subtask, state));
+});
 async function resolveItem(ticket,subtask,action,escalation_id,button){
  const card=button.closest('section');card.querySelectorAll('button').forEach(b=>b.disabled=true);
- try {const response=await fetch(`/tickets/${ticket}/subtasks/${subtask}/escalation/${action}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({escalation_id,note:document.getElementById(`note-${subtask}`).value})});
+ try {const response=await fetch(`/tickets/${ticket}/subtasks/${subtask}/escalation/${action}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({escalation_id,note:(document.getElementById(`note-${subtask}`)?.value || "Closed by human")})});
  const data=await response.json();if(!response.ok)throw Error(data.detail || 'Resolution failed');location.assign(`/tickets/${ticket}`);
  }catch(e){card.querySelector('[role=status]').textContent=e.message;card.querySelectorAll('button').forEach(b=>b.disabled=false);}
 }

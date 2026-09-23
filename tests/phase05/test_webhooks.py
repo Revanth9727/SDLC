@@ -241,7 +241,10 @@ async def test_jira_feedback_decision_uses_shared_gate_resume(monkeypatch, inten
         SimpleNamespace(run=lambda *args: intent))
     assert result == 'replanning'
     assert decisions[0][0] == gate_id
-    assert decisions[0][1] == ApprovalDecision(approval_status='rejected', note='Handle None too')
+    assert decisions[0][1] == ApprovalDecision(
+        approval_status='rejected', note='Handle None too',
+        provenance=f'jira:TEST-1:comment:feedback:gate:{gate_id}',
+    )
 
 
 @pytest.mark.asyncio
@@ -350,6 +353,8 @@ async def test_real_plan_registry_jira_and_ui_share_one_resume(db_ticket, monkey
         async def run(self, state):
             calls.append('execute')
             state.current_step, state.execution_complete = 1, True
+            state.base_commit = 'base-sha'
+            state.file_changes = {'app.py': 'def divide(a, b):\n    return a / b\n'}
             return state
     class Publisher:
         def publish_changes(self, state):
@@ -359,7 +364,9 @@ async def test_real_plan_registry_jira_and_ui_share_one_resume(db_ticket, monkey
     class Critic:
         def run(self, state):
             calls.append('critic')
-            state.critic_verdict = {'approved': True, 'issues': [], 'verifiability': 'ok'}
+            state.critic_verdict = {'approved': True, 'issues': [], 'verifiability': 'ok',
+                                    'test_validity': 'valid', 'test_issues': [],
+                                    'implementation_valid': True}
             return state
     factory = graph_module.build_graph
     monkeypatch.setattr(graph_module, 'build_graph', lambda **kwargs: factory(agent=Diagnosis(), planner=Planner(),

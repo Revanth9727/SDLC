@@ -14,6 +14,7 @@ from app.agents.state import SubtaskState
 from app.db.connection import SessionLocal
 from app.db.models import Ticket, Subtask
 from app.orchestrator import graph as module
+from app.core.subtasks import _advisory_context
 
 
 class FakeLLM:
@@ -102,6 +103,45 @@ def test_budget_is_tracked_from_the_llm_client():
                                  'depends_on': []}], 'reasoning': 'x'})
     result = PlannerAgent(llm).run(_state())
     assert result.budget_used.calls == 1
+
+
+def test_replan_planner_receives_prior_semantic_interaction_evidence():
+    prior = SimpleNamespace(
+        id=uuid.uuid4(), status='needs_human',
+        state={
+            'failure_reason': 'Integration failed after clean merge',
+            'integration_evidence': [{
+                'originally_independent': True,
+                'integration_interaction': True,
+                'subtask_ids': ['sub-1', 'sub-2'],
+                'verification_outcome': 'FAIL',
+                'verification_reason': 'test_combined_checkout failed',
+            }],
+            'integration_issue': {
+                'kind': 'behavioral', 'subtask_ids': ['sub-1', 'sub-2'],
+                'files': ['service.py'], 'symbols': ['checkout'],
+                'report': 'The independent checkout changes interact',
+                'replan_count': 1,
+            },
+        },
+    )
+    advisory = _advisory_context(prior)
+    llm = FakeLLM({'subtasks': [
+        {'spec_id': '1', 'type': 'bug', 'description': 'Reconcile checkout behavior',
+         'repo': 'owner/repo', 'depends_on': []},
+    ], 'reasoning': 'Group the previously interacting checkout work.'})
+
+    PlannerAgent(llm).run(_state(prior_attempt=advisory))
+
+    import json
+    payload = json.loads(llm.calls[0][1])
+    received = payload['previous_attempt_advisory']
+    assert received['integration_evidence'][0]['integration_interaction'] is True
+    assert received['integration_issue']['subtask_ids'] == ['sub-1', 'sub-2']
+    assert received['integration_issue']['files'] == ['service.py']
+    assert received['integration_issue']['symbols'] == ['checkout']
+    assert received['integration_issue']['report'] == 'The independent checkout changes interact'
+    assert 'do NOT blindly repeat' in llm.calls[0][0]
 
 
 def test_decomposition_result_requires_unique_spec_ids():

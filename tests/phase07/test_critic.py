@@ -10,7 +10,8 @@ from langgraph.checkpoint.memory import MemorySaver
 
 from app.agents.critic import CriticAgent, CriticVerdict
 from app.agents.planning import Step
-from app.agents.state import SubtaskState
+from app.agents.state import SubtaskState, UnresolvedCheck
+from app.agents.executor import _record_interface_uncertainties
 from app.config import settings
 from app.db.connection import SessionLocal, engine
 from app.db.models import Ticket, Subtask, TicketBudget
@@ -55,16 +56,20 @@ def _state(**overrides):
 # --- CriticAgent unit tests -------------------------------------------------
 
 def test_critic_approves_a_good_fix_and_tracks_budget():
-    llm = FakeLLM({'approved': True, 'issues': [], 'verifiability': 'ok'})
+    llm = FakeLLM({'approved': True, 'issues': [], 'verifiability': 'ok',
+                   'test_validity': 'valid', 'test_issues': [], 'implementation_valid': True})
     state = _state()
     result = CriticAgent(llm).run(state)
-    assert result.critic_verdict == {'approved': True, 'issues': [], 'verifiability': 'ok'}
+    assert result.critic_verdict == {'approved': True, 'issues': [], 'verifiability': 'ok',
+                                     'test_validity': 'valid', 'test_issues': [],
+                                     'implementation_valid': True}
     assert result.budget_used.calls == 1
 
 
 def test_critic_rejects_with_specific_issues():
     llm = FakeLLM({'approved': False, 'issues': ['Guard does not handle negative b as the ticket also describes'],
-                   'verifiability': 'ok'})
+                   'verifiability': 'ok', 'test_validity': 'valid', 'test_issues': [],
+                   'implementation_valid': False})
     result = CriticAgent(llm).run(_state())
     verdict = CriticVerdict.model_validate(result.critic_verdict)
     assert not verdict.approved
@@ -74,7 +79,8 @@ def test_critic_rejects_with_specific_issues():
 def test_critic_flags_no_tests_without_forcing_rejection():
     # R-32: no_tests is reported, not by itself grounds for rejection — nothing
     # more the Executor can do if the plan already decided none was addable.
-    llm = FakeLLM({'approved': True, 'issues': [], 'verifiability': 'no_tests'})
+    llm = FakeLLM({'approved': True, 'issues': [], 'verifiability': 'no_tests',
+                   'test_validity': 'valid', 'test_issues': [], 'implementation_valid': True})
     result = CriticAgent(llm).run(_state(verifiability='no_tests'))
     verdict = CriticVerdict.model_validate(result.critic_verdict)
     assert verdict.approved and verdict.verifiability == 'no_tests'
@@ -82,7 +88,8 @@ def test_critic_flags_no_tests_without_forcing_rejection():
 
 def test_critic_flags_uncovered_change_and_rejects():
     llm = FakeLLM({'approved': False, 'issues': ['The new negative-b branch in divide() has no test exercising it'],
-                   'verifiability': 'uncovered_change'})
+                   'verifiability': 'uncovered_change', 'test_validity': 'valid', 'test_issues': [],
+                   'implementation_valid': False})
     result = CriticAgent(llm).run(_state())
     verdict = CriticVerdict.model_validate(result.critic_verdict)
     assert not verdict.approved and verdict.verifiability == 'uncovered_change'
@@ -90,7 +97,8 @@ def test_critic_flags_uncovered_change_and_rejects():
 
 
 def test_critic_prompt_grounds_in_the_actual_change_and_prior_feedback():
-    llm = FakeLLM({'approved': True, 'issues': [], 'verifiability': 'ok'})
+    llm = FakeLLM({'approved': True, 'issues': [], 'verifiability': 'ok',
+                   'test_validity': 'valid', 'test_issues': [], 'implementation_valid': True})
     CriticAgent(llm).run(_state(critic_feedback=['add a negative-b test']))
     import json
     payload = json.loads(llm.calls[0][1])
@@ -98,6 +106,61 @@ def test_critic_prompt_grounds_in_the_actual_change_and_prior_feedback():
     assert 'app.py' in payload['changed_files']
     assert payload['last_test_result']['outcome'] == 'passed'
     assert payload['prior_critic_feedback'] == ['add a negative-b test']
+
+
+def test_unresolved_interface_check_reaches_critic_and_persisted_verdict():
+    state = _state()
+    interface_result = SimpleNamespace(
+        skipped_checks=['ExternalResult.passed'],
+        unresolved_types=['ExternalResult'],
+    )
+    _record_interface_uncertainties(state, interface_result, 'tests/test_service.py')
+
+    # The typed blackboard field survives the same JSON round-trip used by DB
+    # checkpoints before the Critic receives it.
+    state = SubtaskState.model_validate(state.model_dump(mode='json'))
+    llm = FakeLLM({
+        'approved': True,
+        'issues': [],
+        'verifiability': 'ok',
+        'test_validity': 'valid',
+        'test_issues': [],
+        'implementation_valid': True,
+    })
+    result = CriticAgent(llm).run(state)
+
+    import json
+    payload = json.loads(llm.calls[0][1])
+    unresolved = payload['checks_that_could_not_be_statically_verified']
+    assert unresolved == [{
+        'owner': 'ExternalResult',
+        'attribute': 'passed',
+        'reason': 'Interface manifest entry for ExternalResult could not be resolved',
+        'source': 'tests/test_service.py',
+        'impact': 'Use of ExternalResult.passed in the generated test was not statically verified',
+    }]
+    verdict = CriticVerdict.model_validate(result.critic_verdict)
+    assert verdict.approved is True
+    assert verdict.confidence == 'medium'
+    assert verdict.unresolved_checks == [UnresolvedCheck.model_validate(unresolved[0])]
+
+
+def test_critic_cannot_treat_an_unresolved_check_as_high_confidence_pass():
+    unresolved = UnresolvedCheck(
+        owner='ExternalResult', attribute='passed', reason='type could not be resolved',
+        source='tests/test_service.py', impact='result.passed was not statically verified',
+    )
+    with pytest.raises(Exception, match='cannot claim high or unspecified confidence'):
+        CriticVerdict.model_validate({
+            'approved': True,
+            'issues': [],
+            'verifiability': 'ok',
+            'test_validity': 'valid',
+            'test_issues': [],
+            'implementation_valid': True,
+            'confidence': 'high',
+            'unresolved_checks': [unresolved.model_dump()],
+        })
 
 
 def test_critic_verdict_rejects_invalid_verifiability_value():
@@ -113,7 +176,7 @@ def gstate():
     tid, sid = uuid.uuid4(), uuid.uuid4()
     state = SubtaskState(ticket_id=str(tid), subtask_id=str(sid), subtask_type='bug', jira_key='TEST-7',
                          repo='owner/repo', confirmed_repos=['owner/repo'], description='Guard division',
-                         approval_status='approved',
+                         approval_status='approved', base_commit='base-sha',
                          plan=[Step(step_id='1', intent='Guard b == 0', target_file='app.py')])
     with SessionLocal() as db:
         db.add(Ticket(id=tid, source='jira', title='Critic test', description='Test', status='processing'))
@@ -191,7 +254,9 @@ async def _approve(graph, state):
 @pytest.mark.asyncio
 async def test_critic_approves_and_uses_the_shared_publish_step(gstate):
     approving = SimpleNamespace(run=Mock(side_effect=lambda s: (
-        setattr(s, 'critic_verdict', {'approved': True, 'issues': [], 'verifiability': 'ok'}), s)[1]))
+        setattr(s, 'critic_verdict', {'approved': True, 'issues': [], 'verifiability': 'ok',
+                                      'test_validity': 'valid', 'test_issues': [],
+                                      'implementation_valid': True}), s)[1]))
     g, jira, publisher = _graph(_diagnosis_stub(), _complete_executor(), approving)
     result = await _approve(g, gstate)
     assert result.status == 'in_review'
@@ -204,12 +269,16 @@ async def test_critic_approves_and_uses_the_shared_publish_step(gstate):
 @pytest.mark.asyncio
 async def test_critic_rejection_sends_it_back_to_executor_with_issues(gstate):
     verdicts = iter([
-        {'approved': False, 'issues': ['Add a negative-b test']},
-        {'approved': True, 'issues': [], 'verifiability': 'ok'},
+        {'approved': False, 'issues': ['Add a negative-b test'], 'test_validity': 'valid',
+         'test_issues': [], 'implementation_valid': False},
+        {'approved': True, 'issues': [], 'verifiability': 'ok', 'test_validity': 'valid',
+         'test_issues': [], 'implementation_valid': True},
     ])
     seen_feedback = []
+    seen_history = []
     def run(state):
         seen_feedback.append(list(state.critic_feedback))
+        seen_history.append(list(state.attempt_history))
         state.critic_verdict = next(verdicts)
         return state
     critic = SimpleNamespace(run=Mock(side_effect=run))
@@ -221,13 +290,16 @@ async def test_critic_rejection_sends_it_back_to_executor_with_issues(gstate):
     assert executor.run.call_count == 2  # redone once after the rejection
     assert result.critic_retry_count == 1
     assert seen_feedback == [[], ['Add a negative-b test']]  # 2nd pass saw the 1st rejection's issues
+    assert seen_history == [[], ['Critic rejection 1: Add a negative-b test']]
     assert any('requested changes' in str(c).lower() for c in jira.comment.call_args_list)
 
 
 @pytest.mark.asyncio
 async def test_critic_rejection_cap_escalates_to_needs_human(gstate):
     def always_reject(state):
-        state.critic_verdict = {'approved': False, 'issues': ['Still missing coverage'], 'verifiability': 'uncovered_change'}
+        state.critic_verdict = {'approved': False, 'issues': ['Still missing coverage'],
+                                'verifiability': 'uncovered_change', 'test_validity': 'valid',
+                                'test_issues': [], 'implementation_valid': False}
         return state
     critic = SimpleNamespace(run=Mock(side_effect=always_reject))
     executor = _complete_executor()
@@ -236,6 +308,7 @@ async def test_critic_rejection_cap_escalates_to_needs_human(gstate):
     assert result.status == 'needs_human'
     assert 'Critic rejected' in result.failure_reason
     assert 'Still missing coverage' in result.failure_reason
+    assert len(result.attempt_history) == settings.max_agent_retries + 1
     assert critic.run.call_count == settings.max_agent_retries + 1
     publisher.publish_changes.assert_not_called()
     jira.set_status.assert_called_with('TEST-7', 'blocked')

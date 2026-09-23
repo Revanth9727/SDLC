@@ -123,6 +123,58 @@ def test_diagnosis_agent_writes_successful_diagnosis() -> None:
     assert "app.py" in llm.calls[0]["user"]
 
 
+def test_diagnosis_context_keeps_implementation_chunk_after_same_file_header() -> None:
+    class HeaderThenImplementationSearch(_FakeSearch):
+        def get_file(self, repo, subtask_id, path, start, end):
+            content = {
+                (1, 3): "from .base import HardCheck\nfrom ..models import HardCheckResult",
+                (4, 8): "class CostProxyCheck(HardCheck):\n    def check(self, output):\n        return len(output) // 4",
+            }[(start, end)]
+            return {"path": path, "start_line": start, "end_line": end, "content": content}
+
+    state = _state()
+    state.code_context["relevant_chunks"] = [
+        {"path": "cost_proxy.py", "start_line": 1, "end_line": 3},
+        {"path": "cost_proxy.py", "start_line": 4, "end_line": 8},
+    ]
+    llm = _FakeLLM(
+        Diagnosis(
+            root_cause="CostProxyCheck uses floor division.",
+            files=["cost_proxy.py"],
+            reasoning="The implementation truncates partial tokens.",
+        )
+    )
+
+    DiagnosisAgent(
+        llm=llm,
+        repo_tool=_FakeRepoTool(),
+        search_tool=HeaderThenImplementationSearch(),
+    ).run(state)
+
+    prompt = llm.calls[0]["user"]
+    assert "from .base import HardCheck" in prompt
+    assert "class CostProxyCheck(HardCheck):" in prompt
+    assert "return len(output) // 4" in prompt
+
+
+def test_diagnosis_receives_prior_attempt_as_advisory_but_rebuilds_current_diagnosis() -> None:
+    current = _state()
+    current.prior_attempt = {
+        "label": "from a previous attempt - re-verify against current code",
+        "failure_reason": "Missing import for ForbiddenPhrasesCheck",
+        "diagnosis": {"root_cause": "old unverified cause", "files": ["old.py"]},
+        "steps_completed": [{"step_id": "1", "intent": "old edit", "target_file": "old.py"}],
+    }
+    llm = _FakeLLM(Diagnosis(root_cause="current verified cause", files=["app.py"], reasoning="current source"))
+
+    result = DiagnosisAgent(llm=llm, repo_tool=_FakeRepoTool(), search_tool=_FakeSearch()).run(current)
+
+    assert "Missing import for ForbiddenPhrasesCheck" in llm.calls[0]["user"]
+    assert "re-verify" in llm.calls[0]["user"]
+    assert result.diagnosis["root_cause"] == "current verified cause"
+    assert result.current_step == 0 and result.steps_done == [] and result.file_changes == {}
+
+
 def test_diagnosis_agent_has_no_root_cause_exit() -> None:
     agent = DiagnosisAgent(
         llm=_FakeLLM(

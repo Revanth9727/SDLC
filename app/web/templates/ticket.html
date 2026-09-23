@@ -129,6 +129,7 @@
       <div class="section-heading"><h2>Plan</h2><span id="gate-badge" class="badge badge--awaiting_approval" hidden>Awaiting approval</span></div>
       <ol id="plan-list" class="plan-list"></ol>
       <p id="plan-reasoning" class="supporting-text"></p>
+      <ul id="plan-constraints" class="supporting-text"></ul>
       <div id="approval-controls" hidden>
         <label for="decision-note">Decision note</label>
         <textarea id="decision-note" maxlength="4000" placeholder="Describe a revision, or leave blank to be asked"></textarea>
@@ -182,7 +183,8 @@
     </section>
   </main>
 
-  <script>
+  <script src="/static/constraint_resolution.js"></script>
+<script>
     const TICKET_ID = {{ (ticket.id|string)|tojson }};
     const HAS_REPO = {{ 'true' if ticket.repos else 'false' }};
     const INITIAL_STATUS = {{ ticket.status|tojson }};
@@ -418,14 +420,34 @@
         }
         if (state.critic_verdict) {
           const verdict = state.critic_verdict;
+          const unresolved = Array.isArray(verdict.unresolved_checks) ? verdict.unresolved_checks : [];
           const critic = document.createElement('div');
-          critic.className = `subtask-critic ${verdict.verifiability !== 'ok' ? 'subtask-critic--warning' : ''}`;
-          critic.appendChild(textNode('strong', `Critic: ${verdict.approved ? 'approved' : 'rejected'} · ${verdict.verifiability || 'ok'}`));
+          critic.className = `subtask-critic ${verdict.verifiability !== 'ok' || unresolved.length ? 'subtask-critic--warning' : ''}`;
+          const confidence = verdict.confidence ? ` · ${verdict.confidence} confidence` : '';
+          critic.appendChild(textNode('strong', `Critic: ${verdict.approved ? 'approved' : 'rejected'} · ${verdict.verifiability || 'ok'}${confidence}`));
           const issues = Array.isArray(verdict.issues) ? verdict.issues.filter(Boolean) : [];
           if (issues.length) critic.appendChild(textNode('p', issues.join('\n')));
+          if (unresolved.length) critic.appendChild(textNode('p',
+            `Not statically verified: ${unresolved.map(item => `${item.owner}.${item.attribute}`).join(', ')}`,
+            'warning-text'));
           article.appendChild(critic);
         }
+        if (state.verification_summary) article.appendChild(verificationSummary(state));
+        if ((state.constraint_conflicts || []).some(c => c.status === 'active') && row.status === 'needs_human') {
+          article.appendChild(window.constraintConflictPanel(TICKET_ID, row.subtask_id, state));
+        }
+        if (state.discovered_defect && !state.discovered_defect.resolution && row.status === 'needs_human') {
+          article.appendChild(discoveredDefectPanel(row));
+        }
+        if (state.integration_issue && !state.integration_issue.resolution && row.status === 'needs_human') {
+          article.appendChild(integrationDecisionPanel(row));
+        }
+        if (state.verifiability === 'unverifiable' && row.verification_prompt?.credentials?.length &&
+            row.status === 'needs_human') {
+          article.appendChild(verificationCredentials(row));
+        }
         if (state.failure_reason) article.appendChild(textNode('p', state.failure_reason, 'failure-text'));
+        appendFailureContext(article, state);
         if (state.pr_url) {
           const link = textNode('a', 'Open pull request', 'subtask-pr');
           try {
@@ -438,6 +460,170 @@
         }
         board.appendChild(article);
       });
+    }
+
+    function verificationSummary(state) {
+      const summary = state.verification_summary || {};
+      const outcome = summary.outcome || 'UNVERIFIABLE';
+      const box = document.createElement('div');
+      box.className = `verification-summary verification-summary--${outcome.toLowerCase()}`;
+      box.append(
+        textNode('strong', `Verification: ${outcome}`),
+        textNode('p', summary.reason || 'No verification details are available.')
+      );
+      const facts = summary.facts || {};
+      const details = [facts.command, facts.exit_code != null ? `exit ${facts.exit_code}` : ''].filter(Boolean).join(' · ');
+      if (details) box.appendChild(textNode('small', details));
+      return box;
+    }
+
+    function discoveredDefectPanel(row) {
+      const state = row.state || {};
+      const defect = state.discovered_defect || {};
+      const box = document.createElement('section');
+      box.className = 'discovered-defect';
+      box.append(
+        textNode('strong', 'Valid test found a separate problem'),
+        textNode('p', defect.failing_behavior || 'The failing behavior is outside the approved ticket scope.'),
+        textNode('p', `Suspected cause: ${defect.suspected_root_cause || 'not proven yet'}`)
+      );
+      const evidence = document.createElement('ul');
+      (defect.evidence || []).forEach(item => evidence.appendChild(textNode('li', item)));
+      if (evidence.childElementCount) box.appendChild(evidence);
+      box.appendChild(textNode('p', 'Choose whether to isolate the original requirement, approve a broader plan, or stop.'));
+      const note = document.createElement('textarea');
+      note.maxLength = 4000; note.placeholder = 'Optional note for the next step';
+      const actions = document.createElement('div'); actions.className = 'action-row';
+      [['stay_scope', 'Stay in scope', 'primary-button'], ['expand_scope', 'Expand scope', 'secondary-button'],
+       ['reject', 'Abort', 'danger-button']].forEach(([action, label, style]) => {
+        const button = textNode('button', label, style); button.type = 'button';
+        button.onclick = async () => {
+          actions.querySelectorAll('button').forEach(item => { item.disabled = true; });
+          try {
+            const response = await fetch(`/tickets/${TICKET_ID}/subtasks/${row.subtask_id}/escalation/${action}`, {
+              method: 'POST', headers: {'Content-Type': 'application/json'},
+              body: JSON.stringify({escalation_id: state.escalation_id, note: note.value})
+            });
+            const data = await response.json();
+            if (!response.ok) throw new Error(errorMessage(data, 'Resolution failed'));
+            await loadSubtasks();
+          } catch (error) {
+            status.textContent = error.message;
+            actions.querySelectorAll('button').forEach(item => { item.disabled = false; });
+          }
+        };
+        actions.appendChild(button);
+      });
+      const status = textNode('span', '', 'inline-status');
+      box.append(note, actions, status);
+      return box;
+    }
+
+    function integrationDecisionPanel(row) {
+      const issue = row.state.integration_issue || {};
+      const box = document.createElement('section');
+      box.className = 'discovered-defect';
+      box.append(
+        textNode('strong', issue.kind === 'textual' ? 'Integration needs a merge decision' : 'Combined behavior needs a decision'),
+        textNode('p', issue.report || 'The approved sub-task changes could not be combined unambiguously.'),
+        textNode('p', `Affected files: ${(issue.files || []).join(', ') || 'not identified'}`)
+      );
+      const intents = document.createElement('ul');
+      (issue.subtasks || []).forEach(item => intents.appendChild(
+        textNode('li', `${item.spec_id || item.id}: ${item.intent}`)
+      ));
+      if (intents.childElementCount) box.appendChild(intents);
+      const note = document.createElement('textarea');
+      note.maxLength = 8000;
+      note.placeholder = 'State the intended combined behavior, or add a note for manual resolution/re-planning';
+      const selector = document.createElement('select');
+      selector.appendChild(new Option('Select a change to reject', ''));
+      (issue.subtasks || []).forEach(item => selector.appendChild(new Option(
+        `${item.spec_id || item.id}: ${item.intent}`, item.id
+      )));
+      const actions = document.createElement('div'); actions.className = 'action-row';
+      const choices = [
+        ['state_intended_behavior', 'Use intended behavior', 'primary-button'],
+        ['reject_change', 'Reject selected change', 'danger-button'],
+        ['resolve_manually', 'Resolve manually', 'secondary-button'],
+        ['replan', 'Re-plan work', 'secondary-button'],
+      ];
+      choices.forEach(([action, label, style]) => {
+        const button = textNode('button', label, style); button.type = 'button';
+        button.onclick = async () => {
+          actions.querySelectorAll('button').forEach(item => { item.disabled = true; });
+          try {
+            const response = await fetch(`/tickets/${TICKET_ID}/integration/${action}`, {
+              method: 'POST', headers: {'Content-Type': 'application/json'},
+              body: JSON.stringify({intended_behavior: note.value,
+                                    reject_subtask_id: selector.value || null})
+            });
+            const data = await response.json();
+            if (!response.ok) throw new Error(errorMessage(data, 'Integration resolution failed'));
+            await loadSubtasks();
+          } catch (error) {
+            status.textContent = error.message;
+            actions.querySelectorAll('button').forEach(item => { item.disabled = false; });
+          }
+        };
+        actions.appendChild(button);
+      });
+      const status = textNode('span', '', 'inline-status');
+      box.append(note, selector, actions, status);
+      return box;
+    }
+
+    function verificationCredentials(row) {
+      const state = row.state || {};
+      const form = document.createElement('form');
+      form.className = 'verification-credentials';
+      form.append(
+        textNode('strong', 'Test credentials required'),
+        textNode('p', 'Suggested fields are optional. Used only for this run, not stored.')
+      );
+      const fields = row.verification_prompt.credentials;
+      fields.forEach(field => {
+        const label = document.createElement('label');
+        label.textContent = field.name + (field.required ? '' : ' (suggested)');
+        const input = document.createElement('input');
+        input.type = 'password'; input.name = field.name; input.autocomplete = 'off'; input.required = field.required;
+        input.setAttribute('aria-label', `Temporary value for ${field.name}`);
+        label.appendChild(input);
+        form.appendChild(label);
+      });
+      const actions = document.createElement('div');
+      actions.className = 'action-row';
+      const submit = textNode('button', 'Run verification', 'primary-button');
+      submit.type = 'submit';
+      const status = textNode('span', '', 'inline-status');
+      actions.append(submit, status);
+      form.appendChild(actions);
+      form.onsubmit = async event => {
+        event.preventDefault();
+        submit.disabled = true;
+        status.textContent = 'Running tests...';
+        const credentials = {};
+        fields.forEach(field => {
+          const value = form.elements[field.name].value;
+          if (value) credentials[field.name] = value;
+        });
+        try {
+          const response = await fetch(`/tickets/${TICKET_ID}/subtasks/${row.subtask_id}/verification-credentials`, {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({escalation_id: state.escalation_id, credentials})
+          });
+          const data = await response.json();
+          if (!response.ok) throw new Error(errorMessage(data, 'Verification could not run'));
+          status.textContent = 'Verification resumed.';
+          await loadSubtasks();
+        } catch (error) {
+          status.textContent = error.message;
+        } finally {
+          fields.forEach(field => { form.elements[field.name].value = ''; });
+          submit.disabled = false;
+        }
+      };
+      return form;
     }
 
     function rememberSubtaskEvent(event) {
@@ -629,6 +815,14 @@
         list.appendChild(item);
       });
       byId('plan-reasoning').textContent = state.plan_reasoning || '';
+      const constraints = byId('plan-constraints');
+      constraints.replaceChildren();
+      (state.execution_constraints || []).forEach(item => {
+        constraints.appendChild(textNode('li', `Approved constraint: ${item.text}`));
+      });
+      (state.pending_execution_constraints || []).forEach(item => {
+        constraints.appendChild(textNode('li', `Clarification to approve: ${item.text}`));
+      });
       byId('gate-badge').hidden = !currentGate;
       byId('approval-controls').hidden = !currentGate;
     }
@@ -639,7 +833,29 @@
       byId('failure-panel').hidden = !failed;
       if (!failed) return;
       byId('failure-reason').textContent = state.failure_reason || 'The run needs human input.';
+      const panel = byId('failure-panel');
+      panel.querySelectorAll('.failure-context').forEach(node => node.remove());
+      appendFailureContext(panel, state);
       byId('retry-btn').hidden = Boolean(active) || !HAS_REPO;
+    }
+
+    function appendFailureContext(target, state) {
+      const records = Array.isArray(state.failure_contexts) ? state.failure_contexts : [];
+      const context = records[records.length - 1];
+      if (!context) return;
+      const details = document.createElement('details');
+      details.className = 'failure-context';
+      details.appendChild(textNode('summary', 'Technical failure details'));
+      const lines = [
+        `Classification: ${context.classification || 'unknown'}`,
+        `Component: ${context.component || 'unknown'}`,
+        `Operation: ${context.operation || 'unknown'}`,
+        `Call site: ${context.file || 'unknown'}:${context.line || 0} in ${context.function || 'unknown'}`,
+        `Exception: ${context.exception_type || 'unknown'}: ${context.message || ''}`,
+        `Reason: ${context.reason || ''}`,
+      ];
+      details.appendChild(textNode('pre', lines.join('\n')));
+      target.appendChild(details);
     }
 
     function renderHistory(rows, activeId) {
@@ -726,12 +942,17 @@
       verificationBadge.className = `badge critic-verifiability--${verifiability}`;
 
       const warning = byId('critic-warning');
+      const unresolved = Array.isArray(verdict.unresolved_checks) ? verdict.unresolved_checks : [];
       const warningText = {
         no_tests: 'This repository has no usable tests, so the change could not be verified automatically.',
         uncovered_change: 'The Critic found changed behavior that is not covered by tests.',
       }[verifiability];
-      warning.hidden = !warningText;
-      warning.textContent = warningText || '';
+      const unresolvedText = unresolved.length
+        ? `Checks not statically verified (${verdict.confidence || 'reduced'} confidence): ` +
+          unresolved.map(item => `${item.owner}.${item.attribute} — ${item.reason}`).join('; ')
+        : '';
+      warning.hidden = !warningText && !unresolvedText;
+      warning.textContent = [warningText, unresolvedText].filter(Boolean).join(' ');
 
       const feedback = Array.isArray(verdict.issues) ? verdict.issues.filter(Boolean) : [];
       byId('critic-feedback-text').textContent = feedback.length

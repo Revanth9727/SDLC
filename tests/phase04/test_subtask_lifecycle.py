@@ -56,7 +56,14 @@ def test_repick_supersedes_active_attempt_and_keeps_only_one():
             type="bug",
             description="old",
             status="running",
-            state={"diagnosis": {"root_cause": "old cause", "files": ["app.py"]}},
+            state={
+                "diagnosis": {"root_cause": "old cause", "files": ["app.py"], "reasoning": "old evidence"},
+                "plan": [{"step_id": "1", "intent": "fix it", "target_file": "app.py", "action": "edit"}],
+                "steps_done": [{"step_id": "1", "intent": "bad edit", "target_file": "app.py",
+                                "content": "must not be inherited"}],
+                "failure_reason": "Generated test missed the import",
+                "attempt_history": ["validator: MissingSymbol was not imported"],
+            },
         ))
         db.commit()
     try:
@@ -78,6 +85,13 @@ def test_repick_supersedes_active_attempt_and_keeps_only_one():
         assert event and "old cause" in event.message
         assert jira.comments[0][0].startswith("R43-")
         assert "old cause" in jira.comments[0][1]
+        assert result.prior_attempt["source_subtask_id"] == str(old_id)
+        assert result.prior_attempt["failure_reason"] == "Generated test missed the import"
+        assert result.prior_attempt["diagnosis"]["root_cause"] == "old cause"
+        assert result.prior_attempt["steps_completed"] == [
+            {"step_id": "1", "intent": "bad edit", "target_file": "app.py"}
+        ]
+        assert "content" not in result.prior_attempt["steps_completed"][0]
     finally:
         with SessionLocal() as db:
             ticket = db.get(Ticket, ticket_id)
@@ -106,12 +120,38 @@ def test_diagnosis_reuses_fresh_claim_subtask():
                 Subtask.status.in_(ACTIVE_SUBTASK_STATUSES),
             ))))
         assert active_count == 1
+        assert diagnosed.prior_attempt is None
     finally:
         with SessionLocal() as db:
             ticket = db.get(Ticket, ticket_id)
             if ticket:
                 db.delete(ticket)
                 db.commit()
+
+
+def test_repick_prior_context_is_ticket_isolated():
+    first_id, other_id = uuid.uuid4(), uuid.uuid4()
+    with SessionLocal() as db:
+        db.add_all([
+            Ticket(id=first_id, source="manual", title="First", description="first"),
+            Ticket(id=other_id, source="manual", title="Other", description="other"),
+            Subtask(ticket_id=first_id, type="bug", description="first", status="needs_human",
+                    state={"failure_reason": "first ticket failure"}),
+            Subtask(ticket_id=other_id, type="bug", description="other", status="needs_human",
+                    state={"failure_reason": "other ticket secret context"}),
+        ])
+        db.commit()
+    try:
+        result = prepare_subtask(first_id, description="retry first")
+        assert result.prior_attempt["failure_reason"] == "first ticket failure"
+        assert "other ticket" not in str(result.prior_attempt)
+    finally:
+        with SessionLocal() as db:
+            for ticket_id in (first_id, other_id):
+                ticket = db.get(Ticket, ticket_id)
+                if ticket:
+                    db.delete(ticket)
+            db.commit()
 
 
 def test_subtasks_api_does_not_reopen_superseded_checkpoint(monkeypatch):

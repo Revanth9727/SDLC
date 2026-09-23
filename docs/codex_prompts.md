@@ -719,6 +719,114 @@ it, and run tests — all streaming live.
 **TEST** — approve the divide-by-zero fix; confirm the local checkout's `app.py`
 now has a zero-check and tests run. Inspect `state->'steps_done'`.
 
+## 5.2.5 Executor retry pipeline (R-32e, R-32f, R-58, R-59)
+
+> **Implementation guidance — read before writing retry or test-validation code.**
+> This sub-step is a CONSTRAINT on how 5.2 is implemented, not an additional feature.
+> When building or extending the Executor's retry loop, the following invariants must hold
+> from the start. Retrofitting them is harder than building them correctly the first time.
+
+**PROMPT**
+```
+Read agent_context.md, ai_rules.md (R-32e, R-32f, R-58, R-59), and architecture.md §8b.
+Extend the Executor retry loop to satisfy the structured retry evidence requirements.
+Stay strictly in scope — do not change the edit applier, relax matching rules, or add new
+agents. This is about what evidence the EXISTING retry passes to the next LLM call.
+
+Required changes (all in executor.py and/or related test-validation tools):
+
+1. RetryAttempt model (R-58a):
+   Add a Pydantic RetryAttempt model (separate from FailureContext) with fields:
+   attempt_number, operation, target, candidate_type,
+   candidate_fingerprint (sha256 of FULL normalized content before truncation),
+   candidate_content (head+tail preview, cap 8,000 chars),
+   candidate_content_truncated (bool — True if cap applied),
+   failure_type, failure_reason, failure_evidence, corrective_instruction.
+   On each reasoning failure, create a RetryAttempt and append it to state.retry_attempts[step_id].
+
+2. State shape and accumulated history (R-58a/R-58b):
+   SubtaskState carries:
+       retry_attempts: dict[str, list[RetryAttempt]]  # key = step_id
+   Each step has its own independent list. A new step_id always starts empty — never inherits
+   another step's retry list. The list is bounded by max_agent_retries + 1 entries.
+   The retry prompt must include ALL prior RetryAttempts for the current step_id, not just the
+   latest. On graph/node restart, the persisted dict is read from checkpoint — no list is lost.
+
+3. Failed candidate in evidence (R-58c):
+   For NoMatch: include the exact SEARCH block(s) that failed in the RetryAttempt
+   (candidate_content). For Ambiguous: include the failed SEARCH text and match count /
+   line ranges (from the Ambiguous exception or applier output).
+
+4. Duplicate-candidate fingerprinting (R-58d, R-58e):
+   Before calling the LLM execution layer, compute sha256(candidate_content). If that hash
+   already appears in any prior RetryAttempt for the current step: do NOT execute it; count
+   it as a failed attempt; add duplication evidence to the next attempt's corrective_instruction.
+   Applies to both edit candidates and generated test bodies.
+
+5. Assertion normalization (R-32e):
+   In the test-validity tool (app/tools/test_validity_validator.py), add a normalizer that
+   extracts expected outcome (PASS or FAIL) from every result-object assertion covering:
+   direct attribute, UnaryOp(Not, …), `is True/False`, `== True/False`. An unrecognized
+   form is logged as unresolved (R-32d), not treated as PASS.
+
+
+Scenario association (R-32 Phase 1): Internal consistency is evaluated per deterministic
+scenario/result binding, scoped by function and assignment. Requirement alignment applies
+only to scenarios safely associated through deterministic literal input or setup evidence,
+checking every mapped scenario. Unrelated scenarios may legitimately expect different
+outcomes; file-level MIXED is not automatically invalid. Preserve scenario evidence and
+outcomes. Inability to map a requirement to a scenario resolves to UNKNOWN, never global
+application or contradiction. Internal consistency still runs when alignment is UNKNOWN.
+
+6. Requirement alignment (R-32f):
+   After normalization, compare each deterministically mapped scenario against the approved
+   ticket requirement; unmapped scenarios remain UNKNOWN.
+   If the requirement is unambiguous and the normalized outcome directly contradicts it, reject
+   the test before running it (reasoning failure → regenerate). The Critic handles subtler
+   cases. Never modify production code to satisfy a requirement-contradicting test.
+
+7. Execution constraints (R-59):
+   Each ExecutionConstraint has: source, text, scope_type (ticket|subtask|step|file|symbol),
+   scope_value, provenance. Add an execution_constraints list field to the Executor payload
+   (separate from repair_feedback). Inclusion rule — deterministic, no heuristics:
+     ticket scope   → always included
+     subtask scope  → scope_value == current subtask_id
+     step scope     → scope_value == current step_id
+     file scope     → scope_value == step.target_file (exact match)
+     symbol scope   → scope_value in step's target/interacting symbols
+   Behavioral human clarifications go at ticket or subtask scope (not step/file). A candidate
+   that violates any included constraint is a reasoning failure → regenerate.
+
+
+Overlapping authoritative constraints with deterministically incompatible normalized behavior
+must block execution until human intent is resolved. No LLM may choose authoritative intent
+precedence. There is no latest-wins, human-over-ticket, or narrower-scope precedence.
+Compare only explicit scope overlap in the isolated ticket/subtask and approved plan, and
+only supported normalized subjects and PASS/FAIL behavior. Arbitrary text is UNKNOWN.
+Identical records are deduplicated; advisory Critic/retry evidence is not authoritative.
+Persist both constraint identities, original text, source/provenance, scope, incompatible
+behavior, overlap evidence, and affected plan targets. This is a needs_human decision,
+not an infrastructure failure or an Executor reasoning retry. The existing human-resolution
+flow must support explicit withdrawal/replacement, clarification and re-planning, preserve
+an audit of the decision, and recheck conflicts before execution can resume. Withdrawn
+constraints must not be recreated from legacy requirement capture on restart.
+
+End by telling me how to observe: (a) a NoMatch retry whose prompt contains the exact prior
+SEARCH block; (b) an identical candidate being rejected as a duplicate; (c) a test asserting
+`not result.passed` for a "should pass" requirement being rejected before running.
+```
+
+**SEE** — in the logged retry prompt for a NoMatch, the exact failed SEARCH block appears;
+a repeated identical edit candidate is rejected without another LLM call; a test that asserts
+FAIL for a requirement that says PASS is rejected with the contradiction named.
+
+**TEST**
+```bash
+pytest tests/phase05/test_execution.py -v -k "retry"
+# Expected: tests covering NoMatch evidence, Ambiguous evidence, duplicate rejection,
+# assertion normalization, requirement alignment, execution_constraints presence.
+```
+
 ## 5.3 Open the real PR
 
 **PROMPT**
@@ -1650,6 +1758,77 @@ incrementally, so repeat tickets are cheap — AND the same tools are shared by 
 (cross-sub-task breakage), so Phase 11 is the existing flow gaining one shared brain rather
 than a Diagnosis-only add-on. Heavier code-intelligence-product features (impact analysis, data lineage, branch-diff graphs, AI-inferred edges, confidence
 dashboards) are deferred beyond this base layer.
+
+---
+
+# PHASE 12 — Verification With Environments (PASS / FAIL / UNVERIFIABLE)
+
+Goal: stop treating "the tests couldn't run" as "the fix is broken." Real repos need
+config/secrets/DB/services to run their tests; without them, tests crash before reaching
+the change. Implements R-56 / R-56b (extends R-32). Built in two steps: the reliable core
+first (12.1), the convenience prediction after (12.2).
+
+**Why here.** This surfaced when the tool tested its own repo (needs the app's env to even
+import), but it applies to ANY serious repo. Core first so the tool is honest about what it
+did and didn't verify; prediction later so the credential prompt is smoother.
+
+## 12.1 Core: three outcomes + UI-only ephemeral secrets
+
+**PROMPT**
+```
+Read agent_context.md, ai_rules.md (R-56, R-32), architecture.md. Stay in scope. Make
+verification classify results into THREE outcomes, deterministically (no LLM), and handle
+missing test credentials safely.
+
+- The test-runner returns PASS / FAIL / UNVERIFIABLE, decided by exit code + error
+  signature: assertion/test failure with a working environment → FAIL; missing env vars,
+  DB/service unreachable, auth failed, or collection/import error → UNVERIFIABLE; tests ran
+  and passed → PASS. The LLM never decides the category; it only receives structured facts
+  (e.g. "db reachable: no"), never raw secrets.
+- FAIL → existing Executor/Critic repair loop. UNVERIFIABLE → does NOT proceed to PR;
+  surface the real reason on the ticket/UI and ask for what's needed. PASS → continue.
+- When UNVERIFIABLE for missing credentials: prompt the user in the UI, BATCHING all
+  currently-known-needed secrets into ONE prompt, labelled "used only for this run, not
+  stored." Inject them into the spawned test process environment only; run; then discard.
+  If a later run reveals one more missing thing, ask only for that.
+- Secrets never go to DB, Jira, comments, memory, LLM prompts, logs, traces, checkpoints,
+  the repo, or the PR. Wrong credentials → UNVERIFIABLE ("auth failed"), not FAIL. If the
+  user can't supply a credential, stay UNVERIFIABLE — never bypass permissions.
+- Runtime result is the source of truth. Show a clear verification summary (what ran,
+  what passed, what's UNVERIFIABLE and why).
+
+End by telling me how to see: a genuine assertion failure → FAIL (repair loop); a repo
+that needs a DB password → UNVERIFIABLE → UI asks (batched) → inject → PASS; and that no
+secret appears in logs/Jira/DB. Confirm the full suite still passes.
+```
+**SEE** — a fix whose tests need a secret shows UNVERIFIABLE with a one-time batched credential prompt, then PASS after you enter it; a real bug shows FAIL and loops.
+**TEST** — assertion failure → FAIL; missing-env → UNVERIFIABLE not FAIL; wrong creds → UNVERIFIABLE; no secret in logs/Jira/DB; UNVERIFIABLE never opens a PR.
+
+## 12.2 Preflight prediction (convenience, best-effort, never a gate)
+
+**PROMPT**
+```
+Read agent_context.md, ai_rules.md (R-56b). Stay in scope. Build on 12.1. Add a best-effort
+PREFLIGHT that scans obvious setup files (.env.example, docker-compose.yml, conftest.py, CI
+config, requirements/pyproject) BEFORE running tests to predict likely-needed secrets, so
+the FIRST batched credential prompt is fuller (fewer round-trips).
+
+Strict rules: preflight is convenience only. It NEVER skips verification, NEVER blocks on a
+predicted-but-unused secret, and NEVER overrides the runtime PASS/FAIL/UNVERIFIABLE from
+12.1. If preflight predicts wrong, the runtime fallback still catches the surprise and asks
+only for that. Do not store anything preflight finds; it only shapes the prompt.
+
+End by telling me how to see preflight pre-fill the first credential prompt, and how a
+secret preflight MISSED is still caught at runtime and asked for separately.
+```
+**SEE** — the first credential prompt already lists the likely secrets; a missed one is still caught when tests run.
+**TEST** — preflight fills the batch prompt; an unpredicted secret still surfaces at runtime as UNVERIFIABLE; a predicted-but-unneeded secret doesn't block PASS.
+
+**Phase 12 done when:** verification reports PASS / FAIL / UNVERIFIABLE honestly and
+deterministically; UNVERIFIABLE never opens a PR; missing test credentials are asked for in
+one batched UI prompt, used only for that run, and never stored or shown to the LLM/Jira/
+logs; and preflight makes the first prompt fuller without ever overriding the real test
+result.
 
 ---
 

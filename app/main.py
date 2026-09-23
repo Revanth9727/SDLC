@@ -425,6 +425,7 @@ async def diagnose_ticket(ticket_id: str) -> JSONResponse:
         repo=repo,
         confirmed_repos=confirmed_repos,
         orchestration_role="coordinator",
+        prior_attempt=replacement.prior_attempt,
     )
     try:
         await asyncio.to_thread(RepoTool().clone_or_pull, repo, subtask_id)

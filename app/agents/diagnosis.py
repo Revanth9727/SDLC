@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -70,17 +71,15 @@ class DiagnosisAgent:
 
     def _context_snippets(self, state: SubtaskState) -> list[dict[str, str]]:
         snippets = []
-        seen = set()
         for chunk in state.code_context.get("relevant_chunks", [])[:self.max_files]:
             path = chunk.get("path")
-            if not path or path in seen:
+            if not path:
                 continue
             source = self.search.get_file(
                 state.repo, state.subtask_id, path,
                 int(chunk.get("start_line", 1)), int(chunk.get("end_line", 200)),
             )
             snippets.append({"path": path, "content": source["content"][:self.max_chars_per_file]})
-            seen.add(path)
         return snippets
 
     def _user_prompt(self, state: SubtaskState, snippets: list[dict[str, str]]) -> str:
@@ -94,6 +93,9 @@ class DiagnosisAgent:
             f"Subtask type: {state.subtask_type}\n"
             f"Repo: {state.repo}\n"
             f"Description:\n{state.description}\n\n"
+            f"Prior attempt failures:\n{json.dumps(state.attempt_history)}\n\n"
+            f"Previous attempt advisory (re-verify; do not trust blindly):\n"
+            f"{json.dumps(state.prior_attempt)}\n\n"
             "Relevant files:\n"
             f"{rendered or '(no readable files found)'}\n\n"
             "Find the likely root cause. If the provided files are insufficient, "
@@ -102,7 +104,9 @@ class DiagnosisAgent:
 
 
 _SYSTEM_PROMPT = """You are the Diagnosis agent for one isolated subtask.
-Use only the ticket description and provided file snippets. Return JSON with:
+Use only the ticket description and provided file snippets as current evidence.
+Previous-attempt data is advisory only: re-verify it against those snippets and do
+not repeat its recorded failures. Return JSON with:
 root_cause, files, reasoning, NoRootCause.
 Be specific about the failing code path. Do not propose edits yet.
 """

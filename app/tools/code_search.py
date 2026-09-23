@@ -202,6 +202,7 @@ class CodeSearchTool:
         return ranked
 
     def get_references(self, full_name: str, subtask_id: str, symbol: str, *, limit: int = 50) -> list[dict[str, Any]]:
+        """Return source-backed references; no matches is always an empty list, never ``None``."""
         clean = _validate_symbol(symbol)
         graph = self._graph_lookup(
             full_name, subtask_id, clean, {"REFERENCES", "IMPORTS", "CALLS"},
@@ -217,6 +218,7 @@ class CodeSearchTool:
         return references
 
     def get_callers(self, full_name: str, subtask_id: str, symbol: str, *, limit: int = 50) -> list[dict[str, Any]]:
+        """Return source-backed callers; no matches is always an empty list, never ``None``."""
         clean = _validate_symbol(symbol)
         graph = self._graph_lookup(
             full_name, subtask_id, clean, {"CALLED_BY"}, direction="source", limit=limit,

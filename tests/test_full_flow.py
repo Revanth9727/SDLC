@@ -98,7 +98,9 @@ class FakeLLM:
                 '    assert divide(6, 2) == 3\n'
             )})
         if name == 'CriticVerdict':
-            return schema.model_validate({'approved': True, 'issues': [], 'verifiability': 'ok'})
+            return schema.model_validate({'approved': True, 'issues': [], 'verifiability': 'ok',
+                                          'test_validity': 'valid', 'test_issues': [],
+                                          'implementation_valid': True})
         raise AssertionError(f'unexpected schema requested: {name}')
 
     def get_usage(self, ticket_id):
@@ -198,7 +200,9 @@ async def test_full_flow_single_subtask_end_to_end(repo):
         assert result.steps_done[0]['tests']['outcome'] == 'no_tests_collected'
         assert result.steps_done[-1]['tests']['outcome'] == 'passed'
         assert result.verifiability == 'verified'
-        assert result.critic_verdict == {'approved': True, 'issues': [], 'verifiability': 'ok'}
+        assert result.critic_verdict == {'approved': True, 'issues': [], 'verifiability': 'ok',
+                                         'test_validity': 'valid', 'test_issues': [],
+                                         'implementation_valid': True}
         assert result.status == 'in_review'
         assert result.pr_url == 'https://github.com/owner/repo/pull/1'
         assert len(api.prs) == 1
